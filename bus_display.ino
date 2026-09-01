@@ -6,29 +6,23 @@
 //  Bibliotheques necessaires (Tools > Manage Libraries) :
 //    - TFT_eSPI (deja installee et configuree)
 //    - ArduinoJson (version 7.x recommandee)
-//    - GovoroxSSLClient (recherche "GovoroxSSLClient" dans le Library Manager)
+//    - GovoroxSSLClient (core ESP32 >= 3.0 uniquement, pour PRIM / TLS 1.3)
 //
 //  IMPORTANT — PRIM exige TLS 1.3 (Cloudflare) :
 //    - Installez le core ESP32 >= 3.0.0 (Boards Manager : "esp32 by Espressif Systems")
 //    - Le core 2.0.x ne supporte que TLS 1.2 et ne peut pas joindre PRIM
+//    - Diagnostics Google/httpbin : WiFiClientSecure natif (setInsecure)
+//    - API PRIM : GovoroxSSLClient avec racines GTS R1 + R4
 //
 // ============================================================
 
 #include <WiFi.h>
 #include <WiFiClient.h>
-#include <SSLClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include "config.h"   // generated from .env — run: python generate_config.py
 #include "prim_ca.h"
-
-#if __has_include("esp_wifi.h")
-#include "esp_wifi.h"
-#endif
-
-#define BUTTON_NEXT   0   // bouton du bas sur la T-Display
-#define TFT_BACKLIGHT 4
-#define PRIM_HOST     "prim.iledefrance-mobilites.fr"
 
 #if defined(ESP_ARDUINO_VERSION) && (ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0))
 #define BOARD_SUPPORTS_TLS13 1
@@ -36,15 +30,34 @@
 #define BOARD_SUPPORTS_TLS13 0
 #endif
 
+#if BOARD_SUPPORTS_TLS13
+#include <SSLClient.h>
+#endif
+
+#if __has_include("esp_wifi.h")
+#include <esp_wifi.h>
+#endif
+
+#if __has_include("mbedtls/error.h")
+#include <mbedtls/error.h>
+#endif
+
+#define BUTTON_NEXT   0   // bouton du bas sur la T-Display
+#define TFT_BACKLIGHT 4
+#define PRIM_HOST     "prim.iledefrance-mobilites.fr"
+#define TLS_HANDSHAKE_TIMEOUT_SEC 20
+
 TFT_eSPI tft = TFT_eSPI();
+
+#if BOARD_SUPPORTS_TLS13
 WiFiClient wifiTransport;
-SSLClient secureClient(&wifiTransport);
+SSLClient primClient(&wifiTransport);
+#endif
 
 int currentStop = 0;
 unsigned long lastFetch = 0;
 bool needsRefresh = true;
 bool networkReady = false;
-bool tlsUseInsecure = false;
 
 void printBoardInfo() {
   Serial.print("ESP32 core: ");
@@ -59,74 +72,149 @@ void printBoardInfo() {
 #endif
 
 #if BOARD_SUPPORTS_TLS13
-  Serial.println("TLS: core 3.x — TLS 1.3 disponible (requis pour PRIM)");
+  Serial.println("TLS: core 3.x — PRIM via GovoroxSSLClient (TLS 1.3)");
 #else
   Serial.println("TLS: core 2.x — TLS 1.2 seulement");
   Serial.println("!! Mettez a jour le core ESP32 vers 3.x pour PRIM !!");
 #endif
 }
 
+void configureNativeInsecure(WiFiClientSecure &client) {
+  client.setInsecure();
+  client.setTimeout(TLS_HANDSHAKE_TIMEOUT_SEC * 1000);
+  client.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_SEC);
+}
+
+#if BOARD_SUPPORTS_TLS13
+void configurePrimClient(bool verifyCert) {
+  primClient.setTimeout(TLS_HANDSHAKE_TIMEOUT_SEC * 1000);
+  primClient.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_SEC);
+  if (verifyCert) {
+    primClient.setCACert(PRIM_ROOT_CA);
+  } else {
+    primClient.setInsecure();
+  }
+}
+
+void stopPrimClient() {
+  primClient.stop();
+  delay(100);
+}
+#endif
+
 const char *describeTlsError(int errCode) {
   switch (errCode) {
-    case -30592: return "alerte fatale du serveur (souvent version TLS incompatible)";
-    case -29184: return "echec verification certificat";
-    case -9984:  return "verification certificat X509 echouee";
-    case -76:    return "connexion TCP refusee ou timeout";
-    case -78:    return "connexion TCP perdue";
-    default:     return nullptr;
+    case -0x7780: return "alerte fatale du serveur (souvent version TLS incompatible)";
+    case -0x7200: return "echec verification certificat";
+    case -0x2700: return "verification certificat X509 echouee";
+    case -0x004C: return "connexion TCP refusee ou timeout";
+    case -0x004E: return "connexion TCP perdue";
+    case -0x0050: return "connexion reseau interrompue";
+    case -2:        return "echec connexion TCP sous-jacente";
+    case -1:        return "client TLS non initialise";
+    default:        return nullptr;
   }
 }
 
-void printTlsError(const char *context) {
+String formatTlsError(int errCode, const char *errBuf) {
+  if (errCode == 0) {
+    return "echec TLS (activez Core Debug Level: Debug pour les logs mbedTLS)";
+  }
+
+  String msg;
+  if (errBuf != nullptr && errBuf[0] != '\0') {
+    msg = errBuf;
+  } else {
+#if __has_include("mbedtls/error.h")
+    char fallback[96];
+    mbedtls_strerror(errCode, fallback, sizeof(fallback));
+    msg = fallback;
+#else
+    msg = "erreur TLS";
+#endif
+  }
+
+  msg += " (code ";
+  msg += errCode;
+  msg += ')';
+
+  const char *hint = describeTlsError(errCode);
+  if (hint != nullptr) {
+    msg += " — ";
+    msg += hint;
+  }
+  return msg;
+}
+
+String readNativeTlsError(WiFiClientSecure &client) {
   char errBuf[160];
-  int errCode = secureClient.lastError(errBuf, sizeof(errBuf));
+  memset(errBuf, 0, sizeof(errBuf));
+  int errCode = client.lastError(errBuf, sizeof(errBuf));
+  return formatTlsError(errCode, errBuf);
+}
+
+#if BOARD_SUPPORTS_TLS13
+String readPrimTlsError() {
+  char errBuf[160];
+  memset(errBuf, 0, sizeof(errBuf));
+  int errCode = primClient.lastError(errBuf, sizeof(errBuf));
+  return formatTlsError(errCode, errBuf);
+}
+#endif
+
+void printTlsError(const char *context, const String &errorMsg) {
   Serial.print(context);
   Serial.print(": ");
-  Serial.print(errBuf);
-  if (errCode != 0) {
-    Serial.print(" (code ");
-    Serial.print(errCode);
-    const char *hint = describeTlsError(errCode);
-    if (hint) {
-      Serial.print(" — ");
-      Serial.print(hint);
-    }
-    Serial.print(')');
-  }
-  Serial.println();
+  Serial.println(errorMsg);
 }
 
-void initSecureClient() {
-  secureClient.setTimeout(20000);
-  secureClient.setHandshakeTimeout(20000);
-
-  // PRIM utilise une chaine Google Trust Services (GTS Root R4).
-  secureClient.setCACert(PRIM_ROOT_CA);
-  tlsUseInsecure = false;
-  Serial.println("TLS: verification avec GTS Root R4");
-}
-
-bool testHttpsHost(const char *host) {
-  secureClient.stop();
-  delay(100);
+bool testHttpsHostNative(const char *host) {
+  WiFiClientSecure client;
+  configureNativeInsecure(client);
 
   Serial.print("Test HTTPS ");
   Serial.print(host);
-  Serial.print(" ... ");
+  Serial.print(" (WiFiClientSecure) ... ");
 
-  if (secureClient.connect(host, 443)) {
+  if (client.connect(host, 443)) {
     Serial.println("OK");
-    secureClient.stop();
+    client.stop();
     delay(100);
     return true;
   }
 
   Serial.println("ECHEC");
-  printTlsError("  detail");
-  secureClient.stop();
+  printTlsError("  detail", readNativeTlsError(client));
+  client.stop();
   delay(100);
   return false;
 }
+
+#if BOARD_SUPPORTS_TLS13
+bool testPrimHost(bool verifyCert) {
+  configurePrimClient(verifyCert);
+  stopPrimClient();
+
+  Serial.print("Connexion HTTPS ");
+  Serial.print(PRIM_HOST);
+  if (verifyCert) {
+    Serial.print(" (certificat GTS) ... ");
+  } else {
+    Serial.print(" (sans verification) ... ");
+  }
+
+  if (primClient.connect(PRIM_HOST, 443)) {
+    Serial.println("OK");
+    stopPrimClient();
+    return true;
+  }
+
+  Serial.println("ECHEC");
+  printTlsError("  detail", readPrimTlsError());
+  stopPrimClient();
+  return false;
+}
+#endif
 
 bool testPrimWithSni() {
   IPAddress ip;
@@ -138,51 +226,50 @@ bool testPrimWithSni() {
   Serial.print("DNS PRIM -> ");
   Serial.println(ip);
 
-  secureClient.stop();
-  delay(100);
+#if BOARD_SUPPORTS_TLS13
+  if (testPrimHost(true)) {
+    return true;
+  }
 
+  Serial.println("  nouvel essai sans verification certificat...");
+  if (testPrimHost(false)) {
+    Serial.println("  OK (insecure) — probleme de certificat, pas de version TLS");
+    return true;
+  }
+  return false;
+#else
+  WiFiClientSecure client;
+  configureNativeInsecure(client);
   Serial.print("Connexion HTTPS ");
   Serial.print(PRIM_HOST);
   Serial.print(" ... ");
-
-  if (secureClient.connect(PRIM_HOST, 443)) {
+  if (client.connect(PRIM_HOST, 443)) {
     Serial.println("OK");
-    secureClient.stop();
-    delay(100);
+    client.stop();
     return true;
   }
-
   Serial.println("ECHEC");
-  printTlsError("  detail");
-
-  // Retry once in insecure mode to separate cert vs protocol issues.
-  Serial.println("  nouvel essai sans verification certificat...");
-  secureClient.setInsecure();
-  tlsUseInsecure = true;
-  delay(100);
-
-  if (secureClient.connect(PRIM_HOST, 443)) {
-    Serial.println("  OK (insecure) — probleme de certificat, pas de version TLS");
-    secureClient.stop();
-    delay(100);
-    return true;
-  }
-
-  secureClient.setCACert(PRIM_ROOT_CA);
-  tlsUseInsecure = false;
-
-  printTlsError("  detail insecure");
-  secureClient.stop();
-  delay(100);
+  printTlsError("  detail", readNativeTlsError(client));
+  client.stop();
   return false;
+#endif
+}
+
+void initSecureClient() {
+#if BOARD_SUPPORTS_TLS13
+  configurePrimClient(true);
+  Serial.println("TLS PRIM: verification GTS Root R1 + R4 (GovoroxSSLClient)");
+#else
+  Serial.println("TLS: WiFiClientSecure (TLS 1.2 seulement)");
+#endif
 }
 
 void runNetworkDiagnostics() {
   Serial.println("--- Diagnostic reseau ---");
   printBoardInfo();
 
-  bool googleOk = testHttpsHost("www.google.com");
-  bool httpbinOk = testHttpsHost("httpbin.org");
+  bool googleOk = testHttpsHostNative("www.google.com");
+  bool httpbinOk = testHttpsHostNative("httpbin.org");
   bool primOk = testPrimWithSni();
 
   Serial.println("--- Resume ---");
@@ -194,16 +281,16 @@ void runNetworkDiagnostics() {
   Serial.println(primOk ? "OK" : "ECHEC");
 
   if (!googleOk && !httpbinOk) {
-    Serial.println("=> Aucun HTTPS ne fonctionne: routeur ou pare-feu probable.");
+    Serial.println("=> Aucun HTTPS ne fonctionne: routeur, pare-feu, ou core ESP32.");
     Serial.println("=> Teste avec un partage de connexion telephone.");
   } else if (googleOk && httpbinOk && !primOk) {
-    Serial.println("=> HTTPS OK mais PRIM echoue.");
+    Serial.println("=> HTTPS general OK mais PRIM echoue.");
 #if !BOARD_SUPPORTS_TLS13
     Serial.println("=> CAUSE PROBABLE: PRIM exige TLS 1.3, votre core ESP32 ne fait que TLS 1.2.");
     Serial.println("=> SOLUTION: Boards Manager -> esp32 by Espressif -> version 3.0.0 ou plus.");
     Serial.println("=> Installez aussi la lib GovoroxSSLClient (Library Manager).");
 #else
-    Serial.println("=> Verifiez la lib GovoroxSSLClient et la memoire libre.");
+    Serial.println("=> Verifiez GovoroxSSLClient, NTP/heure systeme, et la memoire libre.");
     Serial.println("=> PRIM utilise TLS 1.3 uniquement (Cloudflare).");
 #endif
   }
@@ -229,39 +316,33 @@ String urlEncode(const String &value) {
 }
 
 bool fetchHttpsGet(const char *host, const String &path, String &body, String &errorMsg) {
-  secureClient.stop();
-  delay(100);
+#if BOARD_SUPPORTS_TLS13
+  configurePrimClient(true);
+  stopPrimClient();
 
-  if (!secureClient.connect(host, 443)) {
-    char errBuf[160];
-    int errCode = secureClient.lastError(errBuf, sizeof(errBuf));
-    errorMsg = String("Connexion: ") + errBuf;
-    if (errCode != 0) {
-      errorMsg += " (";
-      errorMsg += errCode;
-      errorMsg += ')';
-    }
-    secureClient.stop();
+  if (!primClient.connect(host, 443)) {
+    errorMsg = "Connexion: " + readPrimTlsError();
+    stopPrimClient();
     return false;
   }
 
-  secureClient.printf("GET %s HTTP/1.1\r\n", path.c_str());
-  secureClient.printf("Host: %s\r\n", host);
-  secureClient.printf("apiKey: %s\r\n", PRIM_API_KEY);
-  secureClient.println("Accept: application/json");
-  secureClient.println("User-Agent: bus-display-esp32/1.0");
-  secureClient.println("Connection: close");
-  secureClient.println();
+  primClient.printf("GET %s HTTP/1.1\r\n", path.c_str());
+  primClient.printf("Host: %s\r\n", host);
+  primClient.printf("apiKey: %s\r\n", PRIM_API_KEY);
+  primClient.println("Accept: application/json");
+  primClient.println("User-Agent: bus-display-esp32/1.0");
+  primClient.println("Connection: close");
+  primClient.println();
 
-  String statusLine = secureClient.readStringUntil('\n');
+  String statusLine = primClient.readStringUntil('\n');
   if (statusLine.indexOf("200") < 0) {
     errorMsg = statusLine;
-    secureClient.stop();
+    stopPrimClient();
     return false;
   }
 
-  while (secureClient.connected() || secureClient.available()) {
-    String line = secureClient.readStringUntil('\n');
+  while (primClient.connected() || primClient.available()) {
+    String line = primClient.readStringUntil('\n');
     if (line == "\r" || line.length() <= 1) {
       break;
     }
@@ -269,15 +350,59 @@ bool fetchHttpsGet(const char *host, const String &path, String &body, String &e
 
   body = "";
   unsigned long start = millis();
-  while ((secureClient.connected() || secureClient.available()) && millis() - start < 20000) {
-    while (secureClient.available()) {
-      body += (char)secureClient.read();
+  while ((primClient.connected() || primClient.available()) && millis() - start < 20000) {
+    while (primClient.available()) {
+      body += (char)primClient.read();
     }
     delay(1);
   }
 
-  secureClient.stop();
+  stopPrimClient();
   return body.length() > 0;
+#else
+  WiFiClientSecure client;
+  configureNativeInsecure(client);
+
+  if (!client.connect(host, 443)) {
+    errorMsg = "Connexion: " + readNativeTlsError(client);
+    client.stop();
+    return false;
+  }
+
+  client.printf("GET %s HTTP/1.1\r\n", path.c_str());
+  client.printf("Host: %s\r\n", host);
+  client.printf("apiKey: %s\r\n", PRIM_API_KEY);
+  client.println("Accept: application/json");
+  client.println("User-Agent: bus-display-esp32/1.0");
+  client.println("Connection: close");
+  client.println();
+
+  String statusLine = client.readStringUntil('\n');
+  if (statusLine.indexOf("200") < 0) {
+    errorMsg = statusLine;
+    client.stop();
+    return false;
+  }
+
+  while (client.connected() || client.available()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r" || line.length() <= 1) {
+      break;
+    }
+  }
+
+  body = "";
+  unsigned long start = millis();
+  while ((client.connected() || client.available()) && millis() - start < 20000) {
+    while (client.available()) {
+      body += (char)client.read();
+    }
+    delay(1);
+  }
+
+  client.stop();
+  return body.length() > 0;
+#endif
 }
 
 bool syncNetworkTime() {
