@@ -14,6 +14,7 @@
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <time.h>
 #include <sys/time.h>
 #include <ArduinoJson.h>
@@ -68,52 +69,43 @@ bool syncNetworkTime() {
   return false;
 }
 
-bool fetchHttpsGet(const char *host, const String &path, String &body, String &errorMsg) {
+bool fetchHttpsGet(const char *host, const String &path, String &body, int &httpCode, String &errorMsg) {
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(TLS_TIMEOUT_SEC * 1000);
   client.setHandshakeTimeout(TLS_TIMEOUT_SEC);
 
-  if (!client.connect(host, 443)) {
-    char errBuf[128];
-    int errCode = client.lastError(errBuf, sizeof(errBuf));
-    errorMsg = String("Connexion ") + errCode + ": " + errBuf;
-    client.stop();
+  HTTPClient http;
+  String url = String("https://") + host + path;
+  if (!http.begin(client, url)) {
+    errorMsg = "HTTP init echoue";
     return false;
   }
 
-  client.printf("GET %s HTTP/1.1\r\n", path.c_str());
-  client.printf("Host: %s\r\n", host);
-  client.println("Accept: application/json");
-  client.println("User-Agent: bus-display-esp32/2.0");
-  client.println("Connection: close");
-  client.println();
+  http.setTimeout(TLS_TIMEOUT_SEC * 1000);
+  http.addHeader("Accept", "application/json");
+  http.addHeader("User-Agent", "bus-display-esp32/2.0");
 
-  String statusLine = client.readStringUntil('\n');
-  if (statusLine.indexOf("200") < 0) {
-    errorMsg = statusLine;
-    client.stop();
+  httpCode = http.GET();
+  if (httpCode <= 0) {
+    errorMsg = http.errorToString(httpCode);
+    http.end();
     return false;
   }
 
-  while (client.connected() || client.available()) {
-    String line = client.readStringUntil('\n');
-    if (line == "\r" || line.length() <= 1) {
-      break;
-    }
-  }
-
-  body = "";
-  unsigned long start = millis();
-  while ((client.connected() || client.available()) && millis() - start < 20000) {
-    while (client.available()) {
-      body += (char)client.read();
-    }
-    delay(1);
-  }
-
-  client.stop();
+  body = http.getString();
+  http.end();
   return body.length() > 0;
+}
+
+void showFetchError(const char *label, const char *title, const String &detail) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0, 0);
+  tft.setTextSize(2);
+  tft.println(label);
+  tft.println(title);
+  tft.setTextSize(1);
+  tft.println(detail);
 }
 
 String formatLocalTime(const char *isoUtc) {
@@ -188,13 +180,16 @@ void fetchAndDisplay(Stop &stop) {
 
   String payload;
   String errorMsg;
+  int httpCode = 0;
   for (int attempt = 1; attempt <= 2; attempt++) {
-    if (fetchHttpsGet(LEON_API_HOST, path, payload, errorMsg)) {
+    if (fetchHttpsGet(LEON_API_HOST, path, payload, httpCode, errorMsg)) {
       break;
     }
 
     Serial.print("Tentative ");
     Serial.print(attempt);
+    Serial.print(" - HTTP ");
+    Serial.print(httpCode);
     Serial.print(" - ");
     Serial.println(errorMsg);
 
@@ -204,23 +199,31 @@ void fetchAndDisplay(Stop &stop) {
   }
 
   if (payload.length() == 0) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setCursor(0, 0);
-    tft.println(stop.label);
-    tft.println("Erreur HTTPS");
-    tft.setTextSize(1);
-    tft.println(errorMsg);
+    String detail = "HTTP " + String(httpCode);
+    if (errorMsg.length() > 0) {
+      detail += " - " + errorMsg;
+    }
+    showFetchError(stop.label, "Erreur HTTPS", detail);
+    return;
+  }
+
+  if (httpCode != 200) {
+    showFetchError(stop.label, "Erreur HTTP", String(httpCode) + " - " + errorMsg);
     return;
   }
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setCursor(0, 0);
-    tft.println(stop.label);
-    tft.println("Erreur JSON");
+    showFetchError(stop.label, "Erreur JSON", String(err.c_str()));
     Serial.println(err.c_str());
+    Serial.println(payload.substring(0, 120));
+    return;
+  }
+
+  const char *apiError = doc["error"] | doc["message"] | "";
+  if (apiError[0] != '\0') {
+    showFetchError(stop.label, "Erreur API", apiError);
     return;
   }
 
