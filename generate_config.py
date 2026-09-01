@@ -36,16 +36,20 @@ def main() -> None:
             raise SystemExit(f"Missing required value: {key}")
 
     stop_count = int(env.get("STOP_COUNT", "0"))
-    stops: list[tuple[str, str, str, str]] = []
+    stops: list[tuple[str, str, str, str, str]] = []
     for i in range(1, stop_count + 1):
         raw = env.get(f"STOP_{i}")
         if not raw:
             raise SystemExit(f"Missing STOP_{i}")
         parts = raw.split("|")
-        if len(parts) != 4:
+        if len(parts) < 4 or len(parts) > 5:
             raise SystemExit(
-                f"STOP_{i} must use label|monitoringRef|lineFilter|directionFilter format"
+                f"STOP_{i} must use "
+                "label|monitoringRef|lineFilter|directionFilter|apiLineRef format "
+                "(apiLineRef is optional)"
             )
+        while len(parts) < 5:
+            parts.append("")
         stops.append(tuple(parts))
 
     lines = [
@@ -61,18 +65,20 @@ def main() -> None:
         "  const char* monitoringRef;",
         "  const char* lineFilter;",
         "  const char* directionFilter;",
+        "  const char* apiLineRef;",
         "};",
         "",
         "Stop stops[] = {",
     ]
 
-    for label, monitoring_ref, line_filter, direction_filter in stops:
+    for label, monitoring_ref, line_filter, direction_filter, api_line_ref in stops:
         lines.append(
             "  { "
             f"{c_string(label)}, "
             f"{c_string(monitoring_ref)}, "
             f"{c_string(line_filter)}, "
-            f"{c_string(direction_filter)} "
+            f"{c_string(direction_filter)}, "
+            f"{c_string(api_line_ref)} "
             "},"
         )
 
