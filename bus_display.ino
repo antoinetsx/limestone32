@@ -6,19 +6,20 @@
 //  Bibliotheques necessaires (Tools > Manage Libraries) :
 //    - TFT_eSPI (deja installee et configuree)
 //    - ArduinoJson (version 7.x recommandee)
-//    - GovoroxSSLClient (core ESP32 >= 3.0 uniquement, pour PRIM / TLS 1.3)
+//    - ESP32-EasyWolfSSL + wolfssl (core ESP32 >= 3.0, pour PRIM / TLS 1.3)
 //
 //  IMPORTANT — PRIM exige TLS 1.3 (Cloudflare) :
 //    - Installez le core ESP32 >= 3.0.0 (Boards Manager : "esp32 by Espressif Systems")
 //    - Le core 2.0.x ne supporte que TLS 1.2 et ne peut pas joindre PRIM
-//    - Diagnostics Google/httpbin : WiFiClientSecure natif (setInsecure)
-//    - API PRIM : GovoroxSSLClient avec racines GTS R1 + R4
+//    - Le mbedTLS precompile du core 3.x n'a PAS TLS 1.3 (sdkconfig) :
+//      GovoroxSSLClient ne suffit pas — il reutilise ce mbedTLS.
+//    - Solution : WolfSSLClient (ESP32-EasyWolfSSL) avec racines GTS R1 + R4
+//    - wolfssl : ajoutez FP_MAX_BITS 8192 dans user_settings.h (voir README lib)
 //
 // ============================================================
 
 #include <WiFi.h>
 #include <WiFiClient.h>
-#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include "config.h"   // generated from .env — run: python generate_config.py
@@ -30,8 +31,25 @@
 #define BOARD_SUPPORTS_TLS13 0
 #endif
 
-#if BOARD_SUPPORTS_TLS13
+// mbedTLS du core ESP32 : TLS 1.3 compile ou non ?
+#if defined(CONFIG_MBEDTLS_SSL_PROTO_TLS1_3) && CONFIG_MBEDTLS_SSL_PROTO_TLS1_3
+#define MBEDTLS_HAS_TLS13 1
+#else
+#define MBEDTLS_HAS_TLS13 0
+#endif
+
+#if BOARD_SUPPORTS_TLS13 && MBEDTLS_HAS_TLS13
+// Futur core ESP32 avec TLS 1.3 dans mbedTLS : Govorox possible
+#include <WiFiClientSecure.h>
 #include <SSLClient.h>
+#define PRIM_TLS_BACKEND 2
+#elif BOARD_SUPPORTS_TLS13
+// Core 3.x actuel : mbedTLS sans TLS 1.3 -> WolfSSL
+#include <WolfSSLClient.h>
+#define PRIM_TLS_BACKEND 1
+#else
+#include <WiFiClientSecure.h>
+#define PRIM_TLS_BACKEND 0
 #endif
 
 #if __has_include("esp_wifi.h")
@@ -49,9 +67,11 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-#if BOARD_SUPPORTS_TLS13
+#if PRIM_TLS_BACKEND == 2
 WiFiClient wifiTransport;
 SSLClient primClient(&wifiTransport);
+#elif PRIM_TLS_BACKEND == 1
+WolfSSLClient primClient;
 #endif
 
 int currentStop = 0;
@@ -72,23 +92,47 @@ void printBoardInfo() {
 #endif
 
 #if BOARD_SUPPORTS_TLS13
-  Serial.println("TLS: core 3.x — PRIM via GovoroxSSLClient (TLS 1.3)");
+#if MBEDTLS_HAS_TLS13
+  Serial.println("mbedTLS core: TLS 1.3 compile");
+#else
+  Serial.println("mbedTLS core: TLS 1.2 seulement (TLS 1.3 absent du sdkconfig)");
+#endif
+#if PRIM_TLS_BACKEND == 2
+  Serial.println("PRIM: GovoroxSSLClient (mbedTLS TLS 1.3)");
+#elif PRIM_TLS_BACKEND == 1
+  Serial.println("PRIM: WolfSSLClient (TLS 1.3)");
+#endif
 #else
   Serial.println("TLS: core 2.x — TLS 1.2 seulement");
   Serial.println("!! Mettez a jour le core ESP32 vers 3.x pour PRIM !!");
 #endif
 }
 
+#if PRIM_TLS_BACKEND == 1
+void configureDiagClient(WolfSSLClient &client) {
+  client.setInsecure();
+  client.setTimeout(TLS_HANDSHAKE_TIMEOUT_SEC * 1000);
+}
+#elif PRIM_TLS_BACKEND == 2
 void configureNativeInsecure(WiFiClientSecure &client) {
   client.setInsecure();
   client.setTimeout(TLS_HANDSHAKE_TIMEOUT_SEC * 1000);
   client.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_SEC);
 }
+#else
+void configureNativeInsecure(WiFiClientSecure &client) {
+  client.setInsecure();
+  client.setTimeout(TLS_HANDSHAKE_TIMEOUT_SEC * 1000);
+  client.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_SEC);
+}
+#endif
 
 #if BOARD_SUPPORTS_TLS13
 void configurePrimClient(bool verifyCert) {
   primClient.setTimeout(TLS_HANDSHAKE_TIMEOUT_SEC * 1000);
+#if PRIM_TLS_BACKEND == 2
   primClient.setHandshakeTimeout(TLS_HANDSHAKE_TIMEOUT_SEC);
+#endif
   if (verifyCert) {
     primClient.setCACert(PRIM_ROOT_CA);
   } else {
@@ -118,7 +162,7 @@ const char *describeTlsError(int errCode) {
 
 String formatTlsError(int errCode, const char *errBuf) {
   if (errCode == 0) {
-    return "echec TLS (activez Core Debug Level: Debug pour les logs mbedTLS)";
+    return "echec TLS handshake (Govorox retourne 0 — probablement TLS 1.3 indisponible dans mbedTLS core)";
   }
 
   String msg;
@@ -146,19 +190,25 @@ String formatTlsError(int errCode, const char *errBuf) {
   return msg;
 }
 
+#if PRIM_TLS_BACKEND != 1
 String readNativeTlsError(WiFiClientSecure &client) {
   char errBuf[160];
   memset(errBuf, 0, sizeof(errBuf));
   int errCode = client.lastError(errBuf, sizeof(errBuf));
   return formatTlsError(errCode, errBuf);
 }
+#endif
 
 #if BOARD_SUPPORTS_TLS13
 String readPrimTlsError() {
+#if PRIM_TLS_BACKEND == 2
   char errBuf[160];
   memset(errBuf, 0, sizeof(errBuf));
   int errCode = primClient.lastError(errBuf, sizeof(errBuf));
   return formatTlsError(errCode, errBuf);
+#else
+  return "echec handshake WolfSSL (verifiez NTP, certificat GTS, FP_MAX_BITS dans wolfssl)";
+#endif
 }
 #endif
 
@@ -169,6 +219,26 @@ void printTlsError(const char *context, const String &errorMsg) {
 }
 
 bool testHttpsHostNative(const char *host) {
+#if PRIM_TLS_BACKEND == 1
+  WolfSSLClient client;
+  configureDiagClient(client);
+
+  Serial.print("Test HTTPS ");
+  Serial.print(host);
+  Serial.print(" (WolfSSLClient) ... ");
+
+  if (client.connect(host, 443)) {
+    Serial.println("OK");
+    client.stop();
+    delay(100);
+    return true;
+  }
+
+  Serial.println("ECHEC");
+  client.stop();
+  delay(100);
+  return false;
+#else
   WiFiClientSecure client;
   configureNativeInsecure(client);
 
@@ -188,6 +258,7 @@ bool testHttpsHostNative(const char *host) {
   client.stop();
   delay(100);
   return false;
+#endif
 }
 
 #if BOARD_SUPPORTS_TLS13
@@ -205,6 +276,10 @@ bool testPrimHost(bool verifyCert) {
 
   if (primClient.connect(PRIM_HOST, 443)) {
     Serial.println("OK");
+#if PRIM_TLS_BACKEND == 1
+    Serial.print("  protocole: ");
+    Serial.println(primClient.getProtocolVersion());
+#endif
     stopPrimClient();
     return true;
   }
@@ -258,7 +333,11 @@ bool testPrimWithSni() {
 void initSecureClient() {
 #if BOARD_SUPPORTS_TLS13
   configurePrimClient(true);
+#if PRIM_TLS_BACKEND == 2
   Serial.println("TLS PRIM: verification GTS Root R1 + R4 (GovoroxSSLClient)");
+#elif PRIM_TLS_BACKEND == 1
+  Serial.println("TLS PRIM: verification GTS Root R1 + R4 (WolfSSLClient)");
+#endif
 #else
   Serial.println("TLS: WiFiClientSecure (TLS 1.2 seulement)");
 #endif
@@ -288,7 +367,10 @@ void runNetworkDiagnostics() {
 #if !BOARD_SUPPORTS_TLS13
     Serial.println("=> CAUSE PROBABLE: PRIM exige TLS 1.3, votre core ESP32 ne fait que TLS 1.2.");
     Serial.println("=> SOLUTION: Boards Manager -> esp32 by Espressif -> version 3.0.0 ou plus.");
-    Serial.println("=> Installez aussi la lib GovoroxSSLClient (Library Manager).");
+    Serial.println("=> Installez ESP32-EasyWolfSSL + wolfssl (voir entete du sketch).");
+#elif PRIM_TLS_BACKEND == 1
+    Serial.println("=> Verifiez wolfssl (FP_MAX_BITS 8192), NTP/heure, et ESP32-EasyWolfSSL.");
+    Serial.println("=> PRIM utilise TLS 1.3 uniquement (Cloudflare).");
 #else
     Serial.println("=> Verifiez GovoroxSSLClient, NTP/heure systeme, et la memoire libre.");
     Serial.println("=> PRIM utilise TLS 1.3 uniquement (Cloudflare).");
@@ -449,6 +531,12 @@ void setup() {
   Serial.println("\nWi-Fi connecte !");
   Serial.print("IP locale: ");
   Serial.println(WiFi.localIP());
+
+#if PRIM_TLS_BACKEND == 1
+  if (!WolfSSLClient::initialize()) {
+    Serial.println("ERREUR: initialisation WolfSSL echouee");
+  }
+#endif
 
   initSecureClient();
   syncNetworkTime();
