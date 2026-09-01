@@ -109,8 +109,16 @@ void showFetchError(const char *label, const char *title, const String &detail) 
 }
 
 String formatLocalTime(const char *isoUtc) {
+  char isoBuf[32];
+  strncpy(isoBuf, isoUtc, sizeof(isoBuf) - 1);
+  isoBuf[sizeof(isoBuf) - 1] = '\0';
+  char *fraction = strchr(isoBuf, '.');
+  if (fraction != nullptr) {
+    *fraction = '\0';
+  }
+
   struct tm departure = {};
-  if (strptime(isoUtc, "%Y-%m-%dT%H:%M:%S", &departure) == nullptr) {
+  if (strptime(isoBuf, "%Y-%m-%dT%H:%M:%S", &departure) == nullptr) {
     return "??:??";
   }
 
@@ -129,6 +137,27 @@ String formatLocalTime(const char *isoUtc) {
   return String(buf);
 }
 
+const char *lineCodeFromId(const char *lineId) {
+  if (lineId == nullptr || lineId[0] == '\0') {
+    return "";
+  }
+
+  size_t len = strlen(lineId);
+  while (len > 0 && lineId[len - 1] == ':') {
+    len--;
+  }
+  if (len == 0) {
+    return "";
+  }
+
+  const char *end = lineId + len;
+  const char *start = end - 1;
+  while (start >= lineId && *start != ':') {
+    start--;
+  }
+  return (start >= lineId) ? start + 1 : lineId;
+}
+
 bool branchMatches(const char *branchRef, const char *branchFilter) {
   if (branchFilter == nullptr || strlen(branchFilter) == 0) {
     return true;
@@ -140,7 +169,91 @@ bool lineMatches(const char *lineRef, const char *lineId) {
   if (lineId == nullptr || strlen(lineId) == 0) {
     return true;
   }
-  return strstr(lineRef, lineId) != nullptr;
+
+  const char *code = lineCodeFromId(lineId);
+  if (code[0] == '\0') {
+    return true;
+  }
+  return strstr(lineRef, code) != nullptr;
+}
+
+bool containsIgnoreCase(const char *haystack, const char *needle) {
+  if (needle == nullptr || needle[0] == '\0') {
+    return true;
+  }
+  if (haystack == nullptr) {
+    return false;
+  }
+
+  size_t needleLen = strlen(needle);
+  for (const char *cursor = haystack; *cursor != '\0'; cursor++) {
+    size_t i = 0;
+    while (i < needleLen &&
+           tolower((unsigned char)cursor[i]) == tolower((unsigned char)needle[i])) {
+      i++;
+    }
+    if (i == needleLen) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool destinationMatches(JsonObject departure, const char *destinationFilter) {
+  if (destinationFilter == nullptr || strlen(destinationFilter) == 0) {
+    return true;
+  }
+
+  const char *labels[] = {
+    departure["shortDestinationLabel"] | "",
+    departure["destinationLabel"] | "",
+    departure["directionName"] | "",
+    departure["destinationStopPointLabel"] | "",
+  };
+
+  for (const char *label : labels) {
+    if (containsIgnoreCase(label, destinationFilter)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool isPastDeparture(const char *isoUtc, bool isAtStop) {
+  if (isoUtc == nullptr || isoUtc[0] == '\0') {
+    return false;
+  }
+
+  char isoBuf[32];
+  strncpy(isoBuf, isoUtc, sizeof(isoBuf) - 1);
+  isoBuf[sizeof(isoBuf) - 1] = '\0';
+  char *fraction = strchr(isoBuf, '.');
+  if (fraction != nullptr) {
+    *fraction = '\0';
+  }
+
+  struct tm departure = {};
+  if (strptime(isoBuf, "%Y-%m-%dT%H:%M:%S", &departure) == nullptr) {
+    return false;
+  }
+
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  time_t departureUtc = mktime(&departure);
+
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
+
+  time_t now = time(nullptr);
+  if (departureUtc == (time_t)-1 || now == (time_t)-1) {
+    return false;
+  }
+
+  long secondsUntil = difftime(departureUtc, now);
+  if (isAtStop) {
+    return secondsUntil < -120;
+  }
+  return secondsUntil < -300;
 }
 
 bool isCancelled(JsonObject departure) {
@@ -237,13 +350,21 @@ void fetchAndDisplay(Stop &stop) {
   for (JsonObject departure : departures) {
     const char *branchRef = departure["branchRef"] | "";
     const char *lineRef = departure["lineRef"] | "";
+    const char *dateTime = departure["dateTime"] | "";
+    bool atStop = departure["isAtStop"] | false;
     if (!branchMatches(branchRef, stop.branchHash)) {
       continue;
     }
     if (!lineMatches(lineRef, stop.lineId)) {
       continue;
     }
+    if (!destinationMatches(departure, stop.destinationFilter)) {
+      continue;
+    }
     if (isCancelled(departure)) {
+      continue;
+    }
+    if (isPastDeparture(dateTime, atStop)) {
       continue;
     }
 
@@ -255,7 +376,6 @@ void fetchAndDisplay(Stop &stop) {
       direction = departure["directionName"] | "Destination";
     }
 
-    const char *dateTime = departure["dateTime"] | "";
     String heure = formatLocalTime(dateTime);
 
     tft.println(direction + " -> " + heure);
