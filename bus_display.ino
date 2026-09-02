@@ -50,9 +50,13 @@ static const int ROW2_Y = 90;
 static const int BADGE_X = 5;
 static const int BADGE_Y = 5;
 static const int BADGE_SIZE = 28;
+static const int BADGE_BUS_W = 38;
+static const int BADGE_BUS_H = 22;
+static const int BADGE_GAP = 5;
 static const int BADGE_RADIUS = 4;
 static const int BADGE_CENTER_Y = BADGE_Y + BADGE_SIZE / 2;
-static const int STATION_X = 38;
+static const int STATION_X = BADGE_X + BADGE_SIZE + BADGE_GAP;
+static const int STATION_X_BUS = BADGE_X + BADGE_BUS_W + BADGE_GAP;
 static const int STATION_TEXT_SIZE = 2;
 static const int STATION_TEXT_H = 8 * STATION_TEXT_SIZE;
 static const int STATION_Y = BADGE_CENTER_Y - STATION_TEXT_H / 2;
@@ -390,10 +394,12 @@ void drawLineBadge(const LineTheme &theme) {
                     theme.textColor);
       break;
     case BADGE_BUS:
-    default:
-      drawBadgeBus(BADGE_X, BADGE_Y, BADGE_SIZE, BADGE_SIZE, theme.accent, label,
+    default: {
+      int busY = BADGE_CENTER_Y - BADGE_BUS_H / 2;
+      drawBadgeBus(BADGE_X, busY, BADGE_BUS_W, BADGE_BUS_H, theme.accent, label,
                    theme.textColor);
       break;
+    }
   }
 }
 
@@ -403,8 +409,9 @@ void drawHeader(const Stop &stop, const LineTheme &theme) {
 
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
   tft.setTextSize(STATION_TEXT_SIZE);
-  String station = truncateToWidth(String(stop.label), SCREEN_W - STATION_X - 5, STATION_TEXT_SIZE);
-  tft.setCursor(STATION_X, STATION_Y);
+  int stationX = (theme.mode == BADGE_BUS) ? STATION_X_BUS : STATION_X;
+  String station = truncateToWidth(String(stop.label), SCREEN_W - stationX - 5, STATION_TEXT_SIZE);
+  tft.setCursor(stationX, STATION_Y);
   tft.print(station);
 
   tft.fillRect(0, BODY_Y, SCREEN_W, BORDER_H, theme.accent);
