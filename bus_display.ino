@@ -55,8 +55,8 @@ static const int STATION_X = 38;
 static const int STATION_TEXT_SIZE = 2;
 static const int STATION_TEXT_H = 8 * STATION_TEXT_SIZE;
 static const int STATION_Y = BADGE_CENTER_Y - STATION_TEXT_H / 2;
-static const int MINUTES_NUM_SIZE = 4;
-static const int MINUTES_SUFFIX_SIZE = 2;
+static const int MINUTES_NUM_SIZE = 3;
+static const int MINUTES_SUFFIX_SIZE = 1;
 static const int MINUTES_NUM_H = 8 * MINUTES_NUM_SIZE;
 static const int MINUTES_SUFFIX_H = 8 * MINUTES_SUFFIX_SIZE;
 static const int DEST_PAD_X = 5;
@@ -180,16 +180,31 @@ const char *lineCodeFromId(const char *lineId) {
 
 LineTheme themeForStop(const Stop &stop) {
   const char *code = lineCodeFromId(stop.lineId);
+  uint16_t accent;
+  const char *badgeLabel;
+
   if (strcmp(code, "C01729") == 0) {
-    return {color565FromHex(0xC04191), "E"};
+    accent = color565FromHex(0xC04191);
+    badgeLabel = "E";
+  } else if (strcmp(code, "C01221") == 0) {
+    accent = color565FromHex(0x6E491E);
+    badgeLabel = "206";
+  } else if (strstr(stop.label, "RER") != nullptr) {
+    accent = color565FromHex(0xC04191);
+    badgeLabel = "E";
+  } else {
+    accent = color565FromHex(0x6E491E);
+    badgeLabel = code;
   }
-  if (strcmp(code, "C01221") == 0) {
-    return {color565FromHex(0x6E491E), "206"};
+
+  if (stop.badgeColor != nullptr && stop.badgeColor[0] != '\0') {
+    accent = color565FromHex((uint32_t)strtoul(stop.badgeColor, nullptr, 16));
   }
-  if (strstr(stop.label, "RER") != nullptr) {
-    return {color565FromHex(0xC04191), "E"};
+  if (stop.badgeText != nullptr && stop.badgeText[0] != '\0') {
+    badgeLabel = stop.badgeText;
   }
-  return {color565FromHex(0x6E491E), code};
+
+  return {accent, badgeLabel};
 }
 
 String truncateToWidth(const String &text, int maxWidth, uint8_t textSize) {
