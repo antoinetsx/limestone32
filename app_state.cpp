@@ -1,4 +1,6 @@
 #include "app_state.h"
+#include <WiFi.h>
+#include "config.h"
 
 int currentStop = 0;
 unsigned long lastFetch = 0;
@@ -48,6 +50,45 @@ void rotateToNextStop() {
   gBoardVisible = false;
   gPendingLoadingDraw = true;
   lastStopShownAt = millis();
+}
+
+bool ensureWifiConnected() {
+  static bool wasConnected = true;
+  static unsigned long lastAttempt = 0;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wasConnected) {
+      wasConnected = true;
+      needsRefresh = true;
+      Serial.println("Wi-Fi reconnected");
+    }
+    return true;
+  }
+
+  wasConnected = false;
+  unsigned long now = millis();
+  if (now - lastAttempt < WIFI_RECONNECT_INTERVAL_MS) {
+    return false;
+  }
+  lastAttempt = now;
+
+  Serial.println("Wi-Fi disconnected, reconnecting...");
+  WiFi.disconnect(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  const unsigned long deadline = now + 5000;
+  while (millis() < deadline) {
+    pollNavigationButtons();
+    if (WiFi.status() == WL_CONNECTED) {
+      wasConnected = true;
+      needsRefresh = true;
+      Serial.println("Wi-Fi reconnected");
+      return true;
+    }
+    delay(100);
+  }
+
+  return false;
 }
 
 // Poll NEXT/REFRESH during blocking fetch I/O so stop switches are instant.

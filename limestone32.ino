@@ -80,7 +80,15 @@ void loop() {
     rotateToNextStop();
   }
 
-  if (needsRefresh || millis() - lastFetch > FETCH_INTERVAL_MS) {
+  if (!ensureWifiConnected()) {
+    static unsigned long lastWifiErrorDraw = 0;
+    if (millis() - lastWifiErrorDraw > 5000 || gLastDrawnStopIndex != currentStop ||
+        gShowingLoading) {
+      drawErrorScreen(currentStop, "Wi-Fi disconnected", "Reconnecting...");
+      lastWifiErrorDraw = millis();
+      gBoardVisible = false;
+    }
+  } else if (needsRefresh || millis() - lastFetch > FETCH_INTERVAL_MS) {
     if (fetchAndDisplay(currentStop)) {
       lastFetch = millis();
       needsRefresh = false;
