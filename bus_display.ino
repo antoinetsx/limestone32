@@ -32,8 +32,7 @@
 #define LEON_API_HOST "ecrans-api.gwadz.fr"
 #define FETCH_INTERVAL_MS 60000
 #define TLS_TIMEOUT_SEC 12
-// Buffer small Leon responses in RAM; stream-parse larger hub payloads (RER ~90 KB).
-#define SMALL_RESPONSE_THRESHOLD 32768
+// Leon/Cloudflare omits Content-Length; HTTP/1.0 + getString() reads until close (~100 KB max hub).
 // --- Layout (240x135 landscape, rotation 1) ---
 static const int SCREEN_W = 240;
 static const int SCREEN_H = 135;
@@ -314,8 +313,8 @@ bool syncNetworkTime() {
   return false;
 }
 
-// Hybrid fetch: buffer small responses (reliable getString), stream-parse large hub payloads.
-// Stream reads require HTTP/1.0 — HTTP/1.1 chunked bodies break raw getStream() parsing.
+// Buffer the full body via getString() then parse. HTTP/1.0 avoids chunked encoding;
+// stream deserialize races the socket and yields IncompleteInput on large RER hubs (~96 KB).
 DeserializationError fetchDeparturesJson(const char *host, const String &path, JsonDocument &doc,
                                          const JsonDocument &filterDoc, int &httpCode,
                                          String &errorMsg, int &responseBytes) {
@@ -354,45 +353,31 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
   }
 
   const int contentLength = http.getSize();
-  responseBytes = contentLength;
 
-  if (contentLength >= 0 && contentLength <= SMALL_RESPONSE_THRESHOLD) {
-    String payload;
+  String payload;
+  if (contentLength > 0) {
     payload.reserve((size_t)contentLength + 1);
-    payload = http.getString();
-    http.end();
-    responseBytes = (int)payload.length();
-
-    if (payload.length() == 0) {
-      errorMsg = "Empty response";
-      return DeserializationError::EmptyInput;
-    }
-
-    Serial.print("Fetch: buffered ");
-    Serial.print(responseBytes);
-    Serial.println(" bytes");
-    return deserializeJson(doc, payload, DeserializationOption::Filter(filterDoc));
   }
+  payload = http.getString();
+  http.end();
+  responseBytes = (int)payload.length();
 
-  WiFiClient *stream = http.getStreamPtr();
-  if (stream == nullptr) {
-    errorMsg = "No response stream";
-    http.end();
+  Serial.print("Fetch: buffered ");
+  Serial.print(responseBytes);
+  Serial.print(" bytes (Content-Length: ");
+  if (contentLength >= 0) {
+    Serial.print(contentLength);
+  } else {
+    Serial.print("unknown");
+  }
+  Serial.println(")");
+
+  if (payload.length() == 0) {
+    errorMsg = "Empty response";
     return DeserializationError::EmptyInput;
   }
 
-  stream->setTimeout(TLS_TIMEOUT_SEC * 1000);
-  Serial.print("Fetch: streaming");
-  if (contentLength > 0) {
-    Serial.print(" ~");
-    Serial.print(contentLength);
-  }
-  Serial.println(" bytes");
-
-  DeserializationError err =
-      deserializeJson(doc, *stream, DeserializationOption::Filter(filterDoc));
-  http.end();
-  return err;
+  return deserializeJson(doc, payload, DeserializationOption::Filter(filterDoc));
 }
 
 const char *lineCodeFromId(const char *lineId) {
