@@ -114,7 +114,7 @@ WiFiClientSecure *gActiveFetchClient = nullptr;
 
 LineTheme themes[NB_STOPS];
 char gDeparturePaths[NB_STOPS][DEPARTURE_PATH_MAX];
-JsonDocument gFilterDoc(JSON_FILTER_CAPACITY);
+JsonDocument gFilterDoc;
 
 DepartureRow gDisplayedRows[MAX_DEPARTURES];
 int gDisplayedCount = 0;
@@ -1401,7 +1401,8 @@ bool fetchAndDisplay(int stopIndex) {
   Serial.print(LEON_API_HOST);
   Serial.println(path);
 
-  JsonDocument doc(JSON_DOC_CAPACITY);
+  JsonDocument doc;
+  doc.reserve(JSON_DOC_CAPACITY);
   DeserializationError err = DeserializationError::EmptyInput;
   int httpCode = 0;
   int responseBytes = 0;
@@ -1614,6 +1615,7 @@ void setup() {
       Serial.println(i);
     }
   }
+  gFilterDoc.reserve(JSON_FILTER_CAPACITY);
   configureDeparturesFilter(gFilterDoc);
 }
 
