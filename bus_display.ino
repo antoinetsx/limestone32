@@ -31,7 +31,59 @@
 #define FETCH_INTERVAL_MS 60000
 #define TLS_TIMEOUT_SEC 15
 
+// Layout constants — 240x135 landscape (setRotation 1), matched to Figma frames 61:9 / 62:49
+static const int SCREEN_W = 240;
+static const int SCREEN_H = 135;
+static const int HEADER_H = 38;
+static const int BODY_Y = 38;
+static const int BORDER_H = 5;
+static const int CONTENT_Y = BODY_Y + BORDER_H;
+static const int LEFT_W = 156;
+static const int RIGHT_W = 84;
+static const int RIGHT_X = LEFT_W;
+static const int ROW_H = 45;
+static const int ROW1_Y = 43;
+static const int SEP_Y = 88;
+static const int SEP_H = 2;
+static const int ROW2_Y = 90;
+static const int BADGE_X = 5;
+static const int BADGE_Y = 5;
+static const int BADGE_SIZE = 28;
+static const int BADGE_RADIUS = 4;
+static const int STATION_X = 38;
+static const int STATION_Y = 7;
+static const int DEST_PAD_X = 5;
+static const int DEST_MAX_W = 149;
+static const int MAX_DEPARTURES = 2;
+
 TFT_eSPI tft = TFT_eSPI();
+
+struct DepartureRow {
+  String destination;
+  int minutes;
+};
+
+struct LineTheme {
+  uint16_t accent;
+  const char *badgeLabel;
+};
+
+uint16_t color565FromHex(uint32_t hex) {
+  uint8_t r = (hex >> 16) & 0xFF;
+  uint8_t g = (hex >> 8) & 0xFF;
+  uint8_t b = hex & 0xFF;
+  return tft.color565(r, g, b);
+}
+
+uint16_t gColorDestText;
+uint16_t gColorTimeYellow;
+uint16_t gColorSepGray;
+
+void setupDisplayColors() {
+  gColorDestText = color565FromHex(0x4D565F);
+  gColorTimeYellow = color565FromHex(0xFEC107);
+  gColorSepGray = color565FromHex(0xA9B1B9);
+}
 
 int currentStop = 0;
 unsigned long lastFetch = 0;
@@ -98,45 +150,6 @@ bool fetchHttpsGet(const char *host, const String &path, String &body, int &http
   return body.length() > 0;
 }
 
-void showFetchError(const char *label, const char *title, const String &detail) {
-  tft.fillScreen(TFT_BLACK);
-  tft.setCursor(0, 0);
-  tft.setTextSize(2);
-  tft.println(label);
-  tft.println(title);
-  tft.setTextSize(1);
-  tft.println(detail);
-}
-
-String formatLocalTime(const char *isoUtc) {
-  char isoBuf[32];
-  strncpy(isoBuf, isoUtc, sizeof(isoBuf) - 1);
-  isoBuf[sizeof(isoBuf) - 1] = '\0';
-  char *fraction = strchr(isoBuf, '.');
-  if (fraction != nullptr) {
-    *fraction = '\0';
-  }
-
-  struct tm departure = {};
-  if (strptime(isoBuf, "%Y-%m-%dT%H:%M:%S", &departure) == nullptr) {
-    return "??:??";
-  }
-
-  setenv("TZ", "UTC0", 1);
-  tzset();
-  time_t utc = mktime(&departure);
-
-  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
-  tzset();
-
-  struct tm localTime;
-  localtime_r(&utc, &localTime);
-
-  char buf[6];
-  strftime(buf, sizeof(buf), "%H:%M", &localTime);
-  return String(buf);
-}
-
 const char *lineCodeFromId(const char *lineId) {
   if (lineId == nullptr || lineId[0] == '\0') {
     return "";
@@ -156,6 +169,207 @@ const char *lineCodeFromId(const char *lineId) {
     start--;
   }
   return (start >= lineId) ? start + 1 : lineId;
+}
+
+LineTheme themeForStop(const Stop &stop) {
+  const char *code = lineCodeFromId(stop.lineId);
+  if (strcmp(code, "C01729") == 0) {
+    return {color565FromHex(0xC04191), "E"};
+  }
+  if (strcmp(code, "C01221") == 0) {
+    return {color565FromHex(0x6E491E), "206"};
+  }
+  if (strstr(stop.label, "RER") != nullptr) {
+    return {color565FromHex(0xC04191), "E"};
+  }
+  return {color565FromHex(0x6E491E), code};
+}
+
+String truncateToWidth(const String &text, int maxWidth, uint8_t textSize) {
+  tft.setTextSize(textSize);
+  if ((int)tft.textWidth(text) <= maxWidth) {
+    return text;
+  }
+
+  String truncated = text;
+  while (truncated.length() > 0 && (int)tft.textWidth(truncated + "...") > maxWidth) {
+    truncated.remove(truncated.length() - 1);
+  }
+  return truncated + "...";
+}
+
+int minutesUntilDeparture(const char *isoUtc) {
+  if (isoUtc == nullptr || isoUtc[0] == '\0') {
+    return -1;
+  }
+
+  char isoBuf[32];
+  strncpy(isoBuf, isoUtc, sizeof(isoBuf) - 1);
+  isoBuf[sizeof(isoBuf) - 1] = '\0';
+  char *fraction = strchr(isoBuf, '.');
+  if (fraction != nullptr) {
+    *fraction = '\0';
+  }
+
+  struct tm departure = {};
+  if (strptime(isoBuf, "%Y-%m-%dT%H:%M:%S", &departure) == nullptr) {
+    return -1;
+  }
+
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  time_t departureUtc = mktime(&departure);
+
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
+
+  time_t now = time(nullptr);
+  if (departureUtc == (time_t)-1 || now == (time_t)-1) {
+    return -1;
+  }
+
+  long secondsUntil = difftime(departureUtc, now);
+  if (secondsUntil < 0) {
+    return 0;
+  }
+  return (int)((secondsUntil + 59) / 60);
+}
+
+void drawLineBadge(const LineTheme &theme) {
+  tft.fillRoundRect(BADGE_X, BADGE_Y, BADGE_SIZE, BADGE_SIZE, BADGE_RADIUS, theme.accent);
+
+  tft.setTextColor(TFT_WHITE, theme.accent);
+  const char *label = theme.badgeLabel;
+  size_t labelLen = strlen(label);
+
+  if (labelLen <= 1) {
+    tft.setTextSize(2);
+    int textW = tft.textWidth(label);
+    int textH = 16;
+    tft.setCursor(BADGE_X + (BADGE_SIZE - textW) / 2, BADGE_Y + (BADGE_SIZE - textH) / 2);
+    tft.print(label);
+  } else {
+    tft.setTextSize(1);
+    int textW = tft.textWidth(label);
+    int textH = 8;
+    tft.setCursor(BADGE_X + (BADGE_SIZE - textW) / 2, BADGE_Y + (BADGE_SIZE - textH) / 2);
+    tft.print(label);
+  }
+}
+
+void drawHeader(const Stop &stop, const LineTheme &theme) {
+  tft.fillRect(0, 0, SCREEN_W, HEADER_H, TFT_WHITE);
+  drawLineBadge(theme);
+
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  String station = truncateToWidth(String(stop.label), SCREEN_W - STATION_X - 5, 2);
+  tft.setCursor(STATION_X, STATION_Y);
+  tft.print(station);
+
+  tft.fillRect(0, BODY_Y, SCREEN_W, BORDER_H, theme.accent);
+}
+
+void drawMinutesCell(int rowY, int minutes) {
+  tft.fillRect(RIGHT_X, rowY, RIGHT_W, ROW_H, TFT_BLACK);
+
+  if (minutes < 0) {
+    return;
+  }
+
+  char numBuf[8];
+  snprintf(numBuf, sizeof(numBuf), "%d", minutes);
+
+  tft.setTextColor(gColorTimeYellow, TFT_BLACK);
+  tft.setTextSize(6);
+  int numW = tft.textWidth(numBuf);
+  tft.setTextSize(2);
+  int minW = tft.textWidth("min");
+  int totalW = numW + minW;
+
+  int startX = RIGHT_X + (RIGHT_W - totalW) / 2;
+  int baselineY = rowY + ROW_H - 6;
+
+  tft.setTextSize(6);
+  tft.setCursor(startX, baselineY - 30);
+  tft.print(numBuf);
+
+  tft.setTextSize(2);
+  tft.setCursor(startX + numW, baselineY - 10);
+  tft.print("min");
+}
+
+void drawDestinationCell(int rowY, const String &destination) {
+  tft.fillRect(0, rowY, LEFT_W, ROW_H, TFT_WHITE);
+
+  tft.setTextColor(gColorDestText, TFT_WHITE);
+  tft.setTextSize(2);
+  String dest = truncateToWidth(destination, DEST_MAX_W, 2);
+  tft.setCursor(DEST_PAD_X, rowY + 14);
+  tft.print(dest);
+}
+
+void drawRowSeparator() {
+  tft.fillRect(0, SEP_Y, LEFT_W, SEP_H, TFT_WHITE);
+  tft.fillRect(DEST_PAD_X, SEP_Y, LEFT_W - (DEST_PAD_X * 2), 1, gColorSepGray);
+  tft.fillRect(RIGHT_X, SEP_Y, RIGHT_W, SEP_H, TFT_BLACK);
+  tft.fillRect(RIGHT_X, SEP_Y, RIGHT_W, 1, TFT_WHITE);
+}
+
+void drawDepartureBoard(const Stop &stop, const DepartureRow *rows, int count) {
+  LineTheme theme = themeForStop(stop);
+
+  tft.fillScreen(TFT_WHITE);
+  drawHeader(stop, theme);
+
+  tft.fillRect(0, CONTENT_Y, LEFT_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
+  tft.fillRect(RIGHT_X, CONTENT_Y, RIGHT_W, SCREEN_H - CONTENT_Y, TFT_BLACK);
+
+  if (count >= 1) {
+    drawDestinationCell(ROW1_Y, rows[0].destination);
+    drawMinutesCell(ROW1_Y, rows[0].minutes);
+  } else {
+    drawDestinationCell(ROW1_Y, "Aucun passage");
+    drawMinutesCell(ROW1_Y, -1);
+  }
+
+  drawRowSeparator();
+
+  if (count >= 2) {
+    drawDestinationCell(ROW2_Y, rows[1].destination);
+    drawMinutesCell(ROW2_Y, rows[1].minutes);
+  } else if (count == 0) {
+    drawDestinationCell(ROW2_Y, "");
+    drawMinutesCell(ROW2_Y, -1);
+  } else {
+    drawDestinationCell(ROW2_Y, "");
+    drawMinutesCell(ROW2_Y, -1);
+  }
+}
+
+void drawLoadingScreen(const Stop &stop) {
+  LineTheme theme = themeForStop(stop);
+  tft.fillScreen(TFT_WHITE);
+  drawHeader(stop, theme);
+  tft.fillRect(0, CONTENT_Y, SCREEN_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
+  tft.setTextColor(gColorDestText, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(DEST_PAD_X, ROW1_Y + 14);
+  tft.print("Chargement...");
+}
+
+void drawErrorScreen(const Stop &stop, const char *title, const String &detail) {
+  LineTheme theme = themeForStop(stop);
+  tft.fillScreen(TFT_WHITE);
+  drawHeader(stop, theme);
+  tft.fillRect(0, CONTENT_Y, SCREEN_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(DEST_PAD_X, ROW1_Y + 8);
+  tft.println(title);
+  tft.setTextSize(1);
+  tft.setCursor(DEST_PAD_X, ROW1_Y + 28);
+  tft.println(detail);
 }
 
 bool branchMatches(const char *branchRef, const char *branchFilter) {
@@ -275,14 +489,10 @@ String buildDeparturesPath(const Stop &stop) {
 }
 
 void fetchAndDisplay(Stop &stop) {
-  tft.fillScreen(TFT_BLACK);
-  tft.setCursor(0, 0);
-  tft.setTextSize(2);
-  tft.println(stop.label);
-  tft.println("Chargement...");
+  drawLoadingScreen(stop);
 
   if (WiFi.status() != WL_CONNECTED) {
-    tft.println("Wi-Fi deconnecte");
+    drawErrorScreen(stop, "Wi-Fi deconnecte", "");
     return;
   }
 
@@ -316,19 +526,19 @@ void fetchAndDisplay(Stop &stop) {
     if (errorMsg.length() > 0) {
       detail += " - " + errorMsg;
     }
-    showFetchError(stop.label, "Erreur HTTPS", detail);
+    drawErrorScreen(stop, "Erreur HTTPS", detail);
     return;
   }
 
   if (httpCode != 200) {
-    showFetchError(stop.label, "Erreur HTTP", String(httpCode) + " - " + errorMsg);
+    drawErrorScreen(stop, "Erreur HTTP", String(httpCode) + " - " + errorMsg);
     return;
   }
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
-    showFetchError(stop.label, "Erreur JSON", String(err.c_str()));
+    drawErrorScreen(stop, "Erreur JSON", String(err.c_str()));
     Serial.println(err.c_str());
     Serial.println(payload.substring(0, 120));
     return;
@@ -336,17 +546,14 @@ void fetchAndDisplay(Stop &stop) {
 
   const char *apiError = doc["error"] | doc["message"] | "";
   if (apiError[0] != '\0') {
-    showFetchError(stop.label, "Erreur API", apiError);
+    drawErrorScreen(stop, "Erreur API", apiError);
     return;
   }
 
   JsonArray departures = doc["departures"].as<JsonArray>();
-  tft.fillScreen(TFT_BLACK);
-  tft.setCursor(0, 0);
-  tft.setTextSize(2);
-  tft.println(stop.label);
-
+  DepartureRow rows[MAX_DEPARTURES];
   int shown = 0;
+
   for (JsonObject departure : departures) {
     const char *branchRef = departure["branchRef"] | "";
     const char *lineRef = departure["lineRef"] | "";
@@ -376,18 +583,15 @@ void fetchAndDisplay(Stop &stop) {
       direction = departure["directionName"] | "Destination";
     }
 
-    String heure = formatLocalTime(dateTime);
-
-    tft.println(direction + " -> " + heure);
+    rows[shown].destination = direction;
+    rows[shown].minutes = minutesUntilDeparture(dateTime);
     shown++;
-    if (shown >= 3) {
+    if (shown >= MAX_DEPARTURES) {
       break;
     }
   }
 
-  if (shown == 0) {
-    tft.println("Aucun passage trouve");
-  }
+  drawDepartureBoard(stop, rows, shown);
 }
 
 void setup() {
@@ -401,11 +605,8 @@ void setup() {
 
   tft.init();
   tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.setCursor(0, 0);
-  tft.println("Connexion Wi-Fi...");
+  setupDisplayColors();
+  tft.fillScreen(TFT_WHITE);
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -422,11 +623,6 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   syncNetworkTime();
-
-  tft.fillScreen(TFT_BLACK);
-  tft.setCursor(0, 0);
-  tft.println("Reseau OK");
-  delay(800);
 }
 
 void loop() {
