@@ -96,6 +96,18 @@ uint16_t color565FromHex(uint32_t hex) {
   return tft.color565(r, g, b);
 }
 
+// Perceived luminance (0–255) for badge background hex (RRGGBB).
+uint8_t luminanceFromHex(uint32_t hex) {
+  uint8_t r = (hex >> 16) & 0xFF;
+  uint8_t g = (hex >> 8) & 0xFF;
+  uint8_t b = hex & 0xFF;
+  return (uint8_t)((299U * r + 587U * g + 114U * b) / 1000U);
+}
+
+static const uint32_t BADGE_TEXT_DARK_HEX = 0x231F20;
+static const uint32_t BADGE_TEXT_LIGHT_HEX = 0xFFFFFF;
+static const uint8_t BADGE_LUMINANCE_THRESHOLD = 128;
+
 uint16_t gColorDestText;
 uint16_t gColorTimeYellow;
 uint16_t gColorSepGray;
@@ -247,44 +259,51 @@ BadgeMode inferBadgeMode(const Stop &stop, const char *code, const char *badgeLa
   return BADGE_BUS;
 }
 
-uint16_t textColorForTheme(BadgeMode mode, const Stop &stop) {
+// Badge label color: explicit badgeTextColor in .env, else auto from background.
+// Bus/RER/metro text sits on badgeColor — light bg → dark text, dark bg → white.
+// Tram text sits on the white center band — default dark unless badgeTextColor is set.
+uint16_t textColorForTheme(BadgeMode mode, const Stop &stop, uint32_t accentHex) {
   if (stop.badgeTextColor != nullptr && stop.badgeTextColor[0] != '\0') {
     return color565FromHex((uint32_t)strtoul(stop.badgeTextColor, nullptr, 16));
   }
   if (mode == BADGE_TRAM) {
-    return color565FromHex(0x231F20);
+    return color565FromHex(BADGE_TEXT_DARK_HEX);
   }
-  return TFT_WHITE;
+  if (luminanceFromHex(accentHex) >= BADGE_LUMINANCE_THRESHOLD) {
+    return color565FromHex(BADGE_TEXT_DARK_HEX);
+  }
+  return color565FromHex(BADGE_TEXT_LIGHT_HEX);
 }
 
 LineTheme themeForStop(const Stop &stop) {
   const char *code = lineCodeFromId(stop.lineId);
-  uint16_t accent;
+  uint32_t accentHex;
   const char *badgeLabel;
 
   if (strcmp(code, "C01729") == 0) {
-    accent = color565FromHex(0xC04191);
+    accentHex = 0xC04191;
     badgeLabel = "E";
   } else if (strcmp(code, "C01221") == 0) {
-    accent = color565FromHex(0x6E491E);
+    accentHex = 0x6E491E;
     badgeLabel = "206";
   } else if (strstr(stop.label, "RER") != nullptr) {
-    accent = color565FromHex(0xC04191);
+    accentHex = 0xC04191;
     badgeLabel = "E";
   } else {
-    accent = color565FromHex(0x6E491E);
+    accentHex = 0x6E491E;
     badgeLabel = code;
   }
 
   if (stop.badgeColor != nullptr && stop.badgeColor[0] != '\0') {
-    accent = color565FromHex((uint32_t)strtoul(stop.badgeColor, nullptr, 16));
+    accentHex = (uint32_t)strtoul(stop.badgeColor, nullptr, 16);
   }
   if (stop.badgeText != nullptr && stop.badgeText[0] != '\0') {
     badgeLabel = stop.badgeText;
   }
 
   BadgeMode mode = inferBadgeMode(stop, code, badgeLabel);
-  uint16_t textColor = textColorForTheme(mode, stop);
+  uint16_t accent = color565FromHex(accentHex);
+  uint16_t textColor = textColorForTheme(mode, stop, accentHex);
 
   return {accent, badgeLabel, mode, textColor};
 }
