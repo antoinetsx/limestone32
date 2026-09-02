@@ -355,7 +355,7 @@ bool fetchAndDisplay(int stopIndex) {
   int skippedBranch = 0;
   int skippedLine = 0;
   int skippedDestination = 0;
-  int skippedCancelled = 0;
+  int shownCancelled = 0;
   int skippedPast = 0;
 
   setenv("TZ", "UTC0", 1);
@@ -387,7 +387,15 @@ bool fetchAndDisplay(int stopIndex) {
       continue;
     }
     if (isCancelled(departure)) {
-      skippedCancelled++;
+      copyDestinationLabel(rows[shown].destination, sizeof(rows[shown].destination), departure);
+      rows[shown].minutes = -1;
+      rows[shown].departureEpoch = 0;
+      rows[shown].cancelled = true;
+      shownCancelled++;
+      shown++;
+      if (shown >= MAX_DEPARTURES) {
+        break;
+      }
       continue;
     }
 
@@ -408,6 +416,7 @@ bool fetchAndDisplay(int stopIndex) {
     copyDestinationLabel(rows[shown].destination, sizeof(rows[shown].destination), departure);
     rows[shown].minutes = minutes;
     rows[shown].departureEpoch = depEpoch;
+    rows[shown].cancelled = false;
     shown++;
     if (shown >= MAX_DEPARTURES) {
       break;
@@ -426,7 +435,7 @@ bool fetchAndDisplay(int stopIndex) {
   Serial.print(" dest=");
   Serial.print(skippedDestination);
   Serial.print(" cancelled=");
-  Serial.print(skippedCancelled);
+  Serial.print(shownCancelled);
   Serial.print(" past=");
   Serial.println(skippedPast);
 

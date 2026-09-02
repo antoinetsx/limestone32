@@ -149,6 +149,27 @@ void drawMinutesCell(int rowY, int minutes) {
   tft.print("min");
 }
 
+static void drawCancelledMark(int rowY) {
+  tft.fillRect(RIGHT_X, rowY, RIGHT_W, ROW_H, TFT_BLACK);
+
+  const int cx = RIGHT_X + RIGHT_W / 2;
+  const int cy = rowY + ROW_H / 2;
+  const int half = 11;
+
+  for (int offset = -1; offset <= 1; offset++) {
+    tft.drawLine(cx - half + offset, cy - half, cx + half + offset, cy + half, gColorTimeYellow);
+    tft.drawLine(cx + half + offset, cy - half, cx - half + offset, cy + half, gColorTimeYellow);
+  }
+}
+
+static void drawTimeCell(int rowY, const DepartureRow &row) {
+  if (row.cancelled) {
+    drawCancelledMark(rowY);
+  } else {
+    drawMinutesCell(rowY, row.minutes);
+  }
+}
+
 static void drawDestinationCell(int rowY, const char *destination) {
   tft.fillRect(0, rowY, LEFT_W, ROW_H, TFT_WHITE);
 
@@ -181,7 +202,7 @@ void drawDepartureBoard(int stopIndex, const DepartureRow *rows, int count, bool
 
   if (count >= 1) {
     drawDestinationCell(ROW1_Y, rows[0].destination);
-    drawMinutesCell(ROW1_Y, rows[0].minutes);
+    drawTimeCell(ROW1_Y, rows[0]);
   } else {
     drawDestinationCell(ROW1_Y, "No departures");
     drawMinutesCell(ROW1_Y, -1);
@@ -191,7 +212,7 @@ void drawDepartureBoard(int stopIndex, const DepartureRow *rows, int count, bool
 
   if (count >= 2) {
     drawDestinationCell(ROW2_Y, rows[1].destination);
-    drawMinutesCell(ROW2_Y, rows[1].minutes);
+    drawTimeCell(ROW2_Y, rows[1]);
   } else {
     drawDestinationCell(ROW2_Y, "");
     drawMinutesCell(ROW2_Y, -1);
@@ -253,7 +274,7 @@ void updateMinuteCountdown() {
 
   static const int rowYs[MAX_DEPARTURES] = {ROW1_Y, ROW2_Y};
   for (int i = 0; i < gDisplayedCount; i++) {
-    if (gDisplayedRows[i].departureEpoch == 0) {
+    if (gDisplayedRows[i].cancelled || gDisplayedRows[i].departureEpoch == 0) {
       continue;
     }
     int minutes = 0;

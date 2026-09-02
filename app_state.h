@@ -27,6 +27,7 @@ struct DepartureRow {
   char destination[DEPARTURE_DEST_MAX];
   int minutes;
   time_t departureEpoch;
+  bool cancelled;
 };
 
 enum BadgeMode : uint8_t {
