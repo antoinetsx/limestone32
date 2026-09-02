@@ -50,8 +50,15 @@ static const int BADGE_X = 5;
 static const int BADGE_Y = 5;
 static const int BADGE_SIZE = 28;
 static const int BADGE_RADIUS = 4;
+static const int BADGE_CENTER_Y = BADGE_Y + BADGE_SIZE / 2;
 static const int STATION_X = 38;
-static const int STATION_Y = 7;
+static const int STATION_TEXT_SIZE = 2;
+static const int STATION_TEXT_H = 8 * STATION_TEXT_SIZE;
+static const int STATION_Y = BADGE_CENTER_Y - STATION_TEXT_H / 2;
+static const int MINUTES_NUM_SIZE = 4;
+static const int MINUTES_SUFFIX_SIZE = 2;
+static const int MINUTES_NUM_H = 8 * MINUTES_NUM_SIZE;
+static const int MINUTES_SUFFIX_H = 8 * MINUTES_SUFFIX_SIZE;
 static const int DEST_PAD_X = 5;
 static const int DEST_MAX_W = 149;
 static const int MAX_DEPARTURES = 2;
@@ -262,8 +269,8 @@ void drawHeader(const Stop &stop, const LineTheme &theme) {
   drawLineBadge(theme);
 
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
-  tft.setTextSize(2);
-  String station = truncateToWidth(String(stop.label), SCREEN_W - STATION_X - 5, 2);
+  tft.setTextSize(STATION_TEXT_SIZE);
+  String station = truncateToWidth(String(stop.label), SCREEN_W - STATION_X - 5, STATION_TEXT_SIZE);
   tft.setCursor(STATION_X, STATION_Y);
   tft.print(station);
 
@@ -280,22 +287,38 @@ void drawMinutesCell(int rowY, int minutes) {
   char numBuf[8];
   snprintf(numBuf, sizeof(numBuf), "%d", minutes);
 
+  uint8_t numSize = MINUTES_NUM_SIZE;
+  uint8_t minSize = MINUTES_SUFFIX_SIZE;
+
   tft.setTextColor(gColorTimeYellow, TFT_BLACK);
-  tft.setTextSize(6);
+  tft.setTextSize(numSize);
   int numW = tft.textWidth(numBuf);
-  tft.setTextSize(2);
+  tft.setTextSize(minSize);
   int minW = tft.textWidth("min");
   int totalW = numW + minW;
 
-  int startX = RIGHT_X + (RIGHT_W - totalW) / 2;
-  int baselineY = rowY + ROW_H - 6;
+  if (totalW > RIGHT_W) {
+    numSize = 3;
+    minSize = 2;
+    tft.setTextSize(numSize);
+    numW = tft.textWidth(numBuf);
+    tft.setTextSize(minSize);
+    minW = tft.textWidth("min");
+    totalW = numW + minW;
+  }
 
-  tft.setTextSize(6);
-  tft.setCursor(startX, baselineY - 30);
+  const int numH = 8 * numSize;
+  const int minH = 8 * minSize;
+  const int startX = RIGHT_X + (RIGHT_W - totalW) / 2;
+  const int numY = rowY + (ROW_H - numH) / 2;
+  const int minY = numY + numH - minH;
+
+  tft.setTextSize(numSize);
+  tft.setCursor(startX, numY);
   tft.print(numBuf);
 
-  tft.setTextSize(2);
-  tft.setCursor(startX + numW, baselineY - 10);
+  tft.setTextSize(minSize);
+  tft.setCursor(startX + numW, minY);
   tft.print("min");
 }
 
