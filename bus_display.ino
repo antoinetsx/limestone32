@@ -416,8 +416,11 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
   responseBytes = 0;
   WiFiClientSecure client;
   client.setInsecure();
-  client.setBufferSizes(16384, 512);
-  client.setTimeout(TLS_TIMEOUT_SEC * 1000);
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  client.setConnectionTimeout(TLS_TIMEOUT_SEC * 1000UL);
+#else
+  client.setTimeout(TLS_TIMEOUT_SEC);
+#endif
   client.setHandshakeTimeout(15);
 
   HTTPClient http;
