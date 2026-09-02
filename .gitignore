@@ -1,3 +1,4 @@
 .env
 config.h
+config.cpp
 response.json
