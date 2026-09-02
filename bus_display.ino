@@ -17,6 +17,7 @@
 #include <HTTPClient.h>
 #include <time.h>
 #include <sys/time.h>
+#include <strings.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include "config.h"
@@ -70,9 +71,18 @@ struct DepartureRow {
   int minutes;
 };
 
+enum BadgeMode : uint8_t {
+  BADGE_BUS,
+  BADGE_RER,
+  BADGE_METRO,
+  BADGE_TRAM,
+};
+
 struct LineTheme {
   uint16_t accent;
   const char *badgeLabel;
+  BadgeMode mode;
+  uint16_t textColor;
 };
 
 uint16_t color565FromHex(uint32_t hex) {
@@ -178,6 +188,71 @@ const char *lineCodeFromId(const char *lineId) {
   return (start >= lineId) ? start + 1 : lineId;
 }
 
+BadgeMode parseBadgeMode(const char *modeStr) {
+  if (modeStr == nullptr || modeStr[0] == '\0') {
+    return BADGE_BUS;
+  }
+  if (strcasecmp(modeStr, "bus") == 0) {
+    return BADGE_BUS;
+  }
+  if (strcasecmp(modeStr, "rer") == 0) {
+    return BADGE_RER;
+  }
+  if (strcasecmp(modeStr, "metro") == 0) {
+    return BADGE_METRO;
+  }
+  if (strcasecmp(modeStr, "tram") == 0) {
+    return BADGE_TRAM;
+  }
+  return BADGE_BUS;
+}
+
+BadgeMode inferBadgeMode(const Stop &stop, const char *code, const char *badgeLabel) {
+  if (stop.badgeMode != nullptr && stop.badgeMode[0] != '\0') {
+    return parseBadgeMode(stop.badgeMode);
+  }
+
+  if (strcmp(code, "C01729") == 0 || strstr(stop.label, "RER") != nullptr) {
+    return BADGE_RER;
+  }
+  if (strcmp(code, "C01221") == 0) {
+    return BADGE_BUS;
+  }
+
+  if (badgeLabel != nullptr && badgeLabel[0] != '\0') {
+    if (badgeLabel[0] == 'T' && isdigit((unsigned char)badgeLabel[1])) {
+      return BADGE_TRAM;
+    }
+    if (strlen(badgeLabel) == 1 && isalpha((unsigned char)badgeLabel[0])) {
+      return BADGE_RER;
+    }
+    if (strlen(badgeLabel) <= 2 && isdigit((unsigned char)badgeLabel[0])) {
+      return BADGE_METRO;
+    }
+  }
+
+  if (code[0] == 'C' && code[1] == '0') {
+    if (code[2] == '0') {
+      return BADGE_METRO;
+    }
+    if (code[2] == '1') {
+      return BADGE_RER;
+    }
+  }
+
+  return BADGE_BUS;
+}
+
+uint16_t textColorForTheme(BadgeMode mode, const Stop &stop) {
+  if (stop.badgeTextColor != nullptr && stop.badgeTextColor[0] != '\0') {
+    return color565FromHex((uint32_t)strtoul(stop.badgeTextColor, nullptr, 16));
+  }
+  if (mode == BADGE_TRAM) {
+    return color565FromHex(0x231F20);
+  }
+  return TFT_WHITE;
+}
+
 LineTheme themeForStop(const Stop &stop) {
   const char *code = lineCodeFromId(stop.lineId);
   uint16_t accent;
@@ -204,7 +279,10 @@ LineTheme themeForStop(const Stop &stop) {
     badgeLabel = stop.badgeText;
   }
 
-  return {accent, badgeLabel};
+  BadgeMode mode = inferBadgeMode(stop, code, badgeLabel);
+  uint16_t textColor = textColorForTheme(mode, stop);
+
+  return {accent, badgeLabel, mode, textColor};
 }
 
 String truncateToWidth(const String &text, int maxWidth, uint8_t textSize) {
@@ -257,25 +335,65 @@ int minutesUntilDeparture(const char *isoUtc) {
   return (int)((secondsUntil + 59) / 60);
 }
 
+void drawBadgeTextCentered(int x, int y, int w, int h, const char *label, uint8_t textSize,
+                           uint16_t textColor, uint16_t bgColor) {
+  tft.setTextColor(textColor, bgColor);
+  tft.setTextSize(textSize);
+  int textW = tft.textWidth(label);
+  int textH = 8 * textSize;
+  tft.setCursor(x + (w - textW) / 2, y + (h - textH) / 2);
+  tft.print(label);
+}
+
+void drawBadgeBus(int x, int y, int w, int h, uint16_t accent, const char *label,
+                  uint16_t textColor) {
+  tft.fillRect(x, y, w, h, accent);
+  drawBadgeTextCentered(x, y, w, h, label, 1, textColor, accent);
+}
+
+void drawBadgeRer(int x, int y, int w, int h, uint16_t accent, const char *label,
+                  uint16_t textColor) {
+  tft.fillRoundRect(x, y, w, h, BADGE_RADIUS, accent);
+  drawBadgeTextCentered(x, y, w, h, label, 2, textColor, accent);
+}
+
+void drawBadgeMetro(int x, int y, int w, int h, uint16_t accent, const char *label,
+                    uint16_t textColor) {
+  int cx = x + w / 2;
+  int cy = y + h / 2;
+  tft.fillCircle(cx, cy, w / 2, accent);
+  drawBadgeTextCentered(x, y, w, h, label, 2, textColor, accent);
+}
+
+void drawBadgeTram(int x, int y, int w, int h, uint16_t accent, const char *label,
+                   uint16_t textColor) {
+  const int bandH = 6;
+  tft.fillRect(x, y, w, bandH, accent);
+  tft.fillRect(x, y + h - bandH, w, bandH, accent);
+  tft.fillRect(x, y + bandH, w, h - (2 * bandH), TFT_WHITE);
+  drawBadgeTextCentered(x, y, w, h, label, 1, textColor, TFT_WHITE);
+}
+
 void drawLineBadge(const LineTheme &theme) {
-  tft.fillRoundRect(BADGE_X, BADGE_Y, BADGE_SIZE, BADGE_SIZE, BADGE_RADIUS, theme.accent);
-
-  tft.setTextColor(TFT_WHITE, theme.accent);
   const char *label = theme.badgeLabel;
-  size_t labelLen = strlen(label);
-
-  if (labelLen <= 1) {
-    tft.setTextSize(2);
-    int textW = tft.textWidth(label);
-    int textH = 16;
-    tft.setCursor(BADGE_X + (BADGE_SIZE - textW) / 2, BADGE_Y + (BADGE_SIZE - textH) / 2);
-    tft.print(label);
-  } else {
-    tft.setTextSize(1);
-    int textW = tft.textWidth(label);
-    int textH = 8;
-    tft.setCursor(BADGE_X + (BADGE_SIZE - textW) / 2, BADGE_Y + (BADGE_SIZE - textH) / 2);
-    tft.print(label);
+  switch (theme.mode) {
+    case BADGE_RER:
+      drawBadgeRer(BADGE_X, BADGE_Y, BADGE_SIZE, BADGE_SIZE, theme.accent, label,
+                   theme.textColor);
+      break;
+    case BADGE_METRO:
+      drawBadgeMetro(BADGE_X, BADGE_Y, BADGE_SIZE, BADGE_SIZE, theme.accent, label,
+                     theme.textColor);
+      break;
+    case BADGE_TRAM:
+      drawBadgeTram(BADGE_X, BADGE_Y, BADGE_SIZE, BADGE_SIZE, theme.accent, label,
+                    theme.textColor);
+      break;
+    case BADGE_BUS:
+    default:
+      drawBadgeBus(BADGE_X, BADGE_Y, BADGE_SIZE, BADGE_SIZE, theme.accent, label,
+                   theme.textColor);
+      break;
   }
 }
 
