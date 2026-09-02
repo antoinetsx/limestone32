@@ -88,6 +88,13 @@ enum BadgeMode : uint8_t {
   BADGE_TRAM,
 };
 
+enum ReadHeadersResult : uint8_t {
+  HEADERS_OK,
+  HEADERS_ABORTED,
+  HEADERS_TIMEOUT,
+  HEADERS_ERROR,
+};
+
 struct LineTheme {
   uint16_t accent;
   const char *badgeLabel;
@@ -563,13 +570,6 @@ bool sendHttpGetRequest(WiFiClientSecure &client, const char *host, const String
   client.print("\r\n");
   return true;
 }
-
-enum ReadHeadersResult : uint8_t {
-  HEADERS_OK,
-  HEADERS_ABORTED,
-  HEADERS_TIMEOUT,
-  HEADERS_ERROR,
-};
 
 ReadHeadersResult readHttpResponseHeaders(Stream *stream, int &httpCode, int &contentLength,
                                           char *location, size_t locationLen, uint32_t generation) {
