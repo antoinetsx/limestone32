@@ -31,7 +31,9 @@
 #define TFT_BACKLIGHT 4
 #define LEON_API_HOST "ecrans-api.gwadz.fr"
 #define FETCH_INTERVAL_MS 60000
-#define TLS_TIMEOUT_SEC 15
+#define TLS_TIMEOUT_SEC 12
+// Buffer small Leon responses in RAM; stream-parse larger hub payloads (RER ~90 KB).
+#define SMALL_RESPONSE_THRESHOLD 32768
 // --- Layout (240x135 landscape, rotation 1) ---
 static const int SCREEN_W = 240;
 static const int SCREEN_H = 135;
@@ -312,10 +314,12 @@ bool syncNetworkTime() {
   return false;
 }
 
-// Parse departures JSON directly from the HTTPS stream (avoids getString() truncation on large hub responses).
+// Hybrid fetch: buffer small responses (reliable getString), stream-parse large hub payloads.
+// Stream reads require HTTP/1.0 — HTTP/1.1 chunked bodies break raw getStream() parsing.
 DeserializationError fetchDeparturesJson(const char *host, const String &path, JsonDocument &doc,
                                          const JsonDocument &filterDoc, int &httpCode,
-                                         String &errorMsg) {
+                                         String &errorMsg, int &responseBytes) {
+  responseBytes = 0;
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(TLS_TIMEOUT_SEC * 1000);
@@ -331,6 +335,8 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
 
   http.setTimeout(TLS_TIMEOUT_SEC * 1000);
   http.setReuse(false);
+  http.useHTTP10(true);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.addHeader("Accept", "application/json");
   http.addHeader("User-Agent", "bus-display-esp32/2.0");
 
@@ -347,12 +353,41 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
     return DeserializationError::EmptyInput;
   }
 
+  const int contentLength = http.getSize();
+  responseBytes = contentLength;
+
+  if (contentLength >= 0 && contentLength <= SMALL_RESPONSE_THRESHOLD) {
+    String payload;
+    payload.reserve((size_t)contentLength + 1);
+    payload = http.getString();
+    http.end();
+    responseBytes = (int)payload.length();
+
+    if (payload.length() == 0) {
+      errorMsg = "Empty response";
+      return DeserializationError::EmptyInput;
+    }
+
+    Serial.print("Fetch: buffered ");
+    Serial.print(responseBytes);
+    Serial.println(" bytes");
+    return deserializeJson(doc, payload, DeserializationOption::Filter(filterDoc));
+  }
+
   WiFiClient *stream = http.getStreamPtr();
   if (stream == nullptr) {
     errorMsg = "No response stream";
     http.end();
     return DeserializationError::EmptyInput;
   }
+
+  stream->setTimeout(TLS_TIMEOUT_SEC * 1000);
+  Serial.print("Fetch: streaming");
+  if (contentLength > 0) {
+    Serial.print(" ~");
+    Serial.print(contentLength);
+  }
+  Serial.println(" bytes");
 
   DeserializationError err =
       deserializeJson(doc, *stream, DeserializationOption::Filter(filterDoc));
@@ -865,6 +900,7 @@ bool fetchAndDisplay(Stop &stop) {
   JsonDocument doc;
   DeserializationError err = DeserializationError::EmptyInput;
   int httpCode = 0;
+  int responseBytes = 0;
   String errorMsg;
 
   for (int attempt = 1; attempt <= 2; attempt++) {
@@ -873,7 +909,8 @@ bool fetchAndDisplay(Stop &stop) {
     }
 
     doc.clear();
-    err = fetchDeparturesJson(LEON_API_HOST, path, doc, filterDoc, httpCode, errorMsg);
+    err = fetchDeparturesJson(LEON_API_HOST, path, doc, filterDoc, httpCode, errorMsg,
+                              responseBytes);
 
     if (err == DeserializationError::Ok && !doc.overflowed()) {
       break;
@@ -884,15 +921,20 @@ bool fetchAndDisplay(Stop &stop) {
     Serial.print(" - HTTP ");
     Serial.print(httpCode);
     Serial.print(" - JSON ");
-    Serial.println(err.c_str());
+    Serial.print(err.c_str());
+    if (responseBytes > 0) {
+      Serial.print(" (");
+      Serial.print(responseBytes);
+      Serial.print(" bytes)");
+    }
+    Serial.println();
 
-    const bool retryable = (err == DeserializationError::IncompleteInput ||
-                            err == DeserializationError::NoMemory);
+    const bool retryable = (err == DeserializationError::NoMemory);
     if (!retryable || attempt >= 2) {
       break;
     }
 
-    delayUnlessStale(generation, 1000);
+    delayUnlessStale(generation, 500);
   }
 
   if (isFetchStale(generation)) {
@@ -928,8 +970,16 @@ bool fetchAndDisplay(Stop &stop) {
   }
 
   JsonArray departures = doc["departures"].as<JsonArray>();
+  Serial.print("Parsed departures: ");
+  Serial.println(departures.size());
+
   DepartureRow rows[MAX_DEPARTURES];
   int shown = 0;
+  int skippedBranch = 0;
+  int skippedLine = 0;
+  int skippedDestination = 0;
+  int skippedCancelled = 0;
+  int skippedPast = 0;
 
   for (JsonObject departure : departures) {
     const char *branchRef = departure["branchRef"] | "";
@@ -937,18 +987,23 @@ bool fetchAndDisplay(Stop &stop) {
     const char *dateTime = departure["dateTime"] | "";
     bool atStop = departure["isAtStop"] | false;
     if (!branchMatches(branchRef, stop.branchHash)) {
+      skippedBranch++;
       continue;
     }
     if (!lineMatches(lineRef, stop.lineId)) {
+      skippedLine++;
       continue;
     }
     if (!destinationMatches(departure, stop.destinationFilter)) {
+      skippedDestination++;
       continue;
     }
     if (isCancelled(departure)) {
+      skippedCancelled++;
       continue;
     }
     if (isPastDeparture(dateTime, atStop)) {
+      skippedPast++;
       continue;
     }
 
@@ -967,6 +1022,19 @@ bool fetchAndDisplay(Stop &stop) {
       break;
     }
   }
+
+  Serial.print("After filter: shown=");
+  Serial.print(shown);
+  Serial.print(" skipped branch=");
+  Serial.print(skippedBranch);
+  Serial.print(" line=");
+  Serial.print(skippedLine);
+  Serial.print(" dest=");
+  Serial.print(skippedDestination);
+  Serial.print(" cancelled=");
+  Serial.print(skippedCancelled);
+  Serial.print(" past=");
+  Serial.println(skippedPast);
 
   if (isFetchStale(generation)) {
     return false;
