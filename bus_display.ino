@@ -1,13 +1,13 @@
 // ============================================================
-//  Afficheur de prochains passages (bus / RER) sur TTGO T-Display
-//  Source des donnees : API Leon (ecrans-api.gwadz.fr)
+//  ESP32 bus/RER departure board for TTGO T-Display (240x135)
+//  Data source: Leon API (ecrans-api.gwadz.fr)
 // ============================================================
 //
-//  Bibliotheques necessaires (Tools > Manage Libraries) :
-//    - TFT_eSPI (deja installee et configuree)
-//    - ArduinoJson (version 7.x recommandee)
+//  Libraries (Tools > Manage Libraries):
+//    - TFT_eSPI
+//    - ArduinoJson 7.x
 //
-//  Configuration : copiez .env.example vers .env, puis :
+//  Setup: copy .env.example to .env, then run:
 //    python generate_config.py
 //
 // ============================================================
@@ -32,8 +32,10 @@
 #define LEON_API_HOST "ecrans-api.gwadz.fr"
 #define FETCH_INTERVAL_MS 60000
 #define TLS_TIMEOUT_SEC 15
+// RER hubs return ~35 KB JSON; default JsonDocument pool is too small without a field filter.
+#define JSON_DOC_CAPACITY 28672
 
-// Layout constants — 240x135 landscape (setRotation 1), matched to Figma frames 61:9 / 62:49
+// --- Layout (240x135 landscape, rotation 1) ---
 static const int SCREEN_W = 240;
 static const int SCREEN_H = 135;
 static const int HEADER_H = 38;
@@ -90,6 +92,17 @@ struct LineTheme {
   uint16_t textColor;
 };
 
+int currentStop = 0;
+unsigned long lastFetch = 0;
+bool needsRefresh = true;
+volatile uint32_t fetchGeneration = 0;
+
+uint16_t gColorDestText;
+uint16_t gColorTimeYellow;
+uint16_t gColorSepGray;
+
+// --- Display helpers ---
+
 uint16_t color565FromHex(uint32_t hex) {
   uint8_t r = (hex >> 16) & 0xFF;
   uint8_t g = (hex >> 8) & 0xFF;
@@ -133,19 +146,25 @@ uint32_t bestTextColorForBackground(uint32_t bgHex) {
   return (contrastDark >= contrastLight) ? IDFM_TEXT_DARK : IDFM_TEXT_LIGHT;
 }
 
-uint16_t gColorDestText;
-uint16_t gColorTimeYellow;
-uint16_t gColorSepGray;
-
 void setupDisplayColors() {
   gColorDestText = color565FromHex(0x4D565F);
   gColorTimeYellow = color565FromHex(0xFEC107);
   gColorSepGray = color565FromHex(0xA9B1B9);
 }
 
-int currentStop = 0;
-unsigned long lastFetch = 0;
-bool needsRefresh = true;
+bool isFetchStale(uint32_t generation) {
+  return generation != fetchGeneration;
+}
+
+void delayUnlessStale(uint32_t generation, unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (isFetchStale(generation)) {
+      return;
+    }
+    delay(10);
+  }
+}
 
 String urlEncode(const String &value) {
   String encoded;
@@ -205,7 +224,7 @@ bool utf8Decode(const String &s, size_t &i, uint32_t &cp) {
   return true;
 }
 
-// Transliterate UTF-8 French text to ASCII for GLCD fonts (no accent support).
+// GLCD fonts lack accents; transliterate UTF-8 to ASCII for the TFT.
 String stripAccents(const String &input) {
   String out;
   out.reserve(input.length());
@@ -287,12 +306,12 @@ bool syncNetworkTime() {
   for (int i = 0; i < 20; i++) {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo)) {
-      Serial.println("Heure synchronisee (NTP)");
+      Serial.println("Time synchronized (NTP)");
       return true;
     }
     delay(500);
   }
-  Serial.println("Attention: heure non synchronisee");
+  Serial.println("Warning: time not synchronized");
   return false;
 }
 
@@ -305,7 +324,7 @@ bool fetchHttpsGet(const char *host, const String &path, String &body, int &http
   HTTPClient http;
   String url = String("https://") + host + path;
   if (!http.begin(client, url)) {
-    errorMsg = "HTTP init echoue";
+    errorMsg = "HTTP init failed";
     return false;
   }
 
@@ -370,11 +389,8 @@ BadgeMode inferBadgeMode(const Stop &stop, const char *code, const char *badgeLa
     return parseBadgeMode(stop.badgeMode);
   }
 
-  if (strcmp(code, "C01729") == 0 || strstr(stop.label, "RER") != nullptr) {
+  if (strstr(stop.label, "RER") != nullptr) {
     return BADGE_RER;
-  }
-  if (strcmp(code, "C01221") == 0) {
-    return BADGE_BUS;
   }
 
   if (badgeLabel != nullptr && badgeLabel[0] != '\0') {
@@ -401,8 +417,7 @@ BadgeMode inferBadgeMode(const Stop &stop, const char *code, const char *badgeLa
   return BADGE_BUS;
 }
 
-// Badge label color: WCAG auto-contrast against badge background.
-// Bus/RER/metro text sits on badgeColor; tram text sits on the white center band.
+// WCAG 2.x contrast: bus/RER/metro text on badgeColor; tram text on white center band.
 uint16_t textColorForTheme(BadgeMode mode, uint32_t accentHex) {
   uint32_t bgHex = (mode == BADGE_TRAM) ? IDFM_TEXT_LIGHT : accentHex;
   return color565FromHex(bestTextColorForBackground(bgHex));
@@ -410,21 +425,12 @@ uint16_t textColorForTheme(BadgeMode mode, uint32_t accentHex) {
 
 LineTheme themeForStop(const Stop &stop) {
   const char *code = lineCodeFromId(stop.lineId);
-  uint32_t accentHex;
-  const char *badgeLabel;
+  uint32_t accentHex = 0x6E491E;
+  const char *badgeLabel = code;
 
-  if (strcmp(code, "C01729") == 0) {
+  if (strstr(stop.label, "RER") != nullptr) {
     accentHex = 0xC04191;
     badgeLabel = "E";
-  } else if (strcmp(code, "C01221") == 0) {
-    accentHex = 0x6E491E;
-    badgeLabel = "206";
-  } else if (strstr(stop.label, "RER") != nullptr) {
-    accentHex = 0xC04191;
-    badgeLabel = "E";
-  } else {
-    accentHex = 0x6E491E;
-    badgeLabel = code;
   }
 
   if (stop.badgeColor != nullptr && stop.badgeColor[0] != '\0') {
@@ -645,7 +651,7 @@ void drawDepartureBoard(const Stop &stop, const DepartureRow *rows, int count) {
     drawDestinationCell(ROW1_Y, rows[0].destination);
     drawMinutesCell(ROW1_Y, rows[0].minutes);
   } else {
-    drawDestinationCell(ROW1_Y, "Aucun passage");
+    drawDestinationCell(ROW1_Y, "No departures");
     drawMinutesCell(ROW1_Y, -1);
   }
 
@@ -654,9 +660,6 @@ void drawDepartureBoard(const Stop &stop, const DepartureRow *rows, int count) {
   if (count >= 2) {
     drawDestinationCell(ROW2_Y, rows[1].destination);
     drawMinutesCell(ROW2_Y, rows[1].minutes);
-  } else if (count == 0) {
-    drawDestinationCell(ROW2_Y, "");
-    drawMinutesCell(ROW2_Y, -1);
   } else {
     drawDestinationCell(ROW2_Y, "");
     drawMinutesCell(ROW2_Y, -1);
@@ -671,7 +674,7 @@ void drawLoadingScreen(const Stop &stop) {
   tft.setTextColor(gColorDestText, TFT_WHITE);
   tft.setTextSize(2);
   tft.setCursor(DEST_PAD_X, ROW1_Y + 14);
-  tft.print("Chargement...");
+  tft.print("Loading...");
 }
 
 void drawErrorScreen(const Stop &stop, const char *title, const String &detail) {
@@ -687,6 +690,8 @@ void drawErrorScreen(const Stop &stop, const char *title, const String &detail) 
   tft.setCursor(DEST_PAD_X, ROW1_Y + 28);
   tft.println(stripAccents(detail));
 }
+
+// --- Departure filtering ---
 
 bool branchMatches(const char *branchRef, const char *branchFilter) {
   if (branchFilter == nullptr || strlen(branchFilter) == 0) {
@@ -804,16 +809,36 @@ String buildDeparturesPath(const Stop &stop) {
   return path;
 }
 
-void fetchAndDisplay(Stop &stop) {
+void configureDeparturesFilter(JsonDocument &filter) {
+  filter.clear();
+  filter["error"] = true;
+  filter["message"] = true;
+  filter["departures"][*]["branchRef"] = true;
+  filter["departures"][*]["lineRef"] = true;
+  filter["departures"][*]["dateTime"] = true;
+  filter["departures"][*]["isAtStop"] = true;
+  filter["departures"][*]["shortDestinationLabel"] = true;
+  filter["departures"][*]["destinationLabel"] = true;
+  filter["departures"][*]["directionName"] = true;
+  filter["departures"][*]["destinationStopPointLabel"] = true;
+  filter["departures"][*]["flags"] = true;
+}
+
+// Returns true when the board was drawn; false when superseded by a stop switch.
+bool fetchAndDisplay(Stop &stop) {
+  const uint32_t generation = fetchGeneration;
   drawLoadingScreen(stop);
+  if (isFetchStale(generation)) {
+    return false;
+  }
 
   if (WiFi.status() != WL_CONNECTED) {
-    drawErrorScreen(stop, "Wi-Fi deconnecte", "");
-    return;
+    drawErrorScreen(stop, "Wi-Fi disconnected", "");
+    return !isFetchStale(generation);
   }
 
   String path = buildDeparturesPath(stop);
-  Serial.print("Requete: https://");
+  Serial.print("Request: https://");
   Serial.print(LEON_API_HOST);
   Serial.println(path);
 
@@ -821,11 +846,15 @@ void fetchAndDisplay(Stop &stop) {
   String errorMsg;
   int httpCode = 0;
   for (int attempt = 1; attempt <= 2; attempt++) {
+    if (isFetchStale(generation)) {
+      return false;
+    }
+
     if (fetchHttpsGet(LEON_API_HOST, path, payload, httpCode, errorMsg)) {
       break;
     }
 
-    Serial.print("Tentative ");
+    Serial.print("Attempt ");
     Serial.print(attempt);
     Serial.print(" - HTTP ");
     Serial.print(httpCode);
@@ -833,8 +862,12 @@ void fetchAndDisplay(Stop &stop) {
     Serial.println(errorMsg);
 
     if (attempt < 2) {
-      delay(1000);
+      delayUnlessStale(generation, 1000);
     }
+  }
+
+  if (isFetchStale(generation)) {
+    return false;
   }
 
   if (payload.length() == 0) {
@@ -842,28 +875,40 @@ void fetchAndDisplay(Stop &stop) {
     if (errorMsg.length() > 0) {
       detail += " - " + errorMsg;
     }
-    drawErrorScreen(stop, "Erreur HTTPS", detail);
-    return;
+    drawErrorScreen(stop, "HTTPS error", detail);
+    return !isFetchStale(generation);
   }
 
   if (httpCode != 200) {
-    drawErrorScreen(stop, "Erreur HTTP", String(httpCode) + " - " + errorMsg);
-    return;
+    drawErrorScreen(stop, "HTTP error", String(httpCode) + " - " + errorMsg);
+    return !isFetchStale(generation);
   }
 
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, payload);
+  JsonDocument filter;
+  configureDeparturesFilter(filter);
+
+  JsonDocument doc(JSON_DOC_CAPACITY);
+  DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
   if (err) {
-    drawErrorScreen(stop, "Erreur JSON", String(err.c_str()));
+    String detail = String(err.c_str());
+    detail += " (";
+    detail += payload.length();
+    detail += " bytes)";
+    drawErrorScreen(stop, "JSON error", detail);
     Serial.println(err.c_str());
-    Serial.println(payload.substring(0, 120));
-    return;
+    Serial.print("Payload bytes: ");
+    Serial.println(payload.length());
+    return !isFetchStale(generation);
+  }
+
+  if (isFetchStale(generation)) {
+    return false;
   }
 
   const char *apiError = doc["error"] | doc["message"] | "";
   if (apiError[0] != '\0') {
-    drawErrorScreen(stop, "Erreur API", apiError);
-    return;
+    drawErrorScreen(stop, "API error", apiError);
+    return !isFetchStale(generation);
   }
 
   JsonArray departures = doc["departures"].as<JsonArray>();
@@ -907,7 +952,12 @@ void fetchAndDisplay(Stop &stop) {
     }
   }
 
+  if (isFetchStale(generation)) {
+    return false;
+  }
+
   drawDepartureBoard(stop, rows, shown);
+  return true;
 }
 
 void setup() {
@@ -934,8 +984,8 @@ void setup() {
     delay(300);
     Serial.print(".");
   }
-  Serial.println("\nWi-Fi connecte !");
-  Serial.print("IP locale: ");
+  Serial.println("\nWi-Fi connected");
+  Serial.print("Local IP: ");
   Serial.println(WiFi.localIP());
 
   syncNetworkTime();
@@ -945,6 +995,7 @@ void loop() {
   static bool lastState = HIGH;
   bool state = digitalRead(BUTTON_NEXT);
   if (state == LOW && lastState == HIGH) {
+    fetchGeneration++;
     currentStop = (currentStop + 1) % NB_STOPS;
     needsRefresh = true;
     delay(50);
@@ -952,8 +1003,9 @@ void loop() {
   lastState = state;
 
   if (needsRefresh || millis() - lastFetch > FETCH_INTERVAL_MS) {
-    fetchAndDisplay(stops[currentStop]);
-    lastFetch = millis();
-    needsRefresh = false;
+    if (fetchAndDisplay(stops[currentStop])) {
+      lastFetch = millis();
+      needsRefresh = false;
+    }
   }
 }
