@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate config.h and config.cpp from .env for the bus_display Arduino sketch."""
+"""Generate config.h and config.cpp from .env for the Limestone32 Arduino sketch."""
 
 from __future__ import annotations
 

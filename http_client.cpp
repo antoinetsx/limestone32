@@ -192,7 +192,7 @@ static bool sendHttpGetRequest(WiFiClientSecure &client, const char *host, const
   client.print("\r\n");
   client.print("Accept: application/json\r\n");
   client.print("Accept-Encoding: identity\r\n");
-  client.print("User-Agent: bus-display-esp32/2.0\r\n");
+  client.print("User-Agent: limestone32-esp32/2.0\r\n");
   client.print("Connection: close\r\n");
   client.print("\r\n");
   return true;

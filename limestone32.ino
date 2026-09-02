@@ -1,5 +1,5 @@
 // ============================================================
-//  ESP32 bus/RER departure board for TTGO T-Display (240x135)
+//  Limestone32 — ESP32 bus/RER departure board for TTGO T-Display (240x135)
 //  Data source: Leon API (ecrans-api.gwadz.fr)
 // ============================================================
 //
