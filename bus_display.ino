@@ -27,7 +27,8 @@
 #include <esp_wifi.h>
 #endif
 
-#define BUTTON_NEXT   0
+#define BUTTON_NEXT     0
+#define BUTTON_REFRESH  35  // input-only; T-Display has external pull-up
 #define TFT_BACKLIGHT 4
 #define LEON_API_HOST "ecrans-api.gwadz.fr"
 #define FETCH_INTERVAL_MS 60000
@@ -1191,6 +1192,7 @@ void setup() {
   digitalWrite(TFT_BACKLIGHT, HIGH);
 
   pinMode(BUTTON_NEXT, INPUT_PULLUP);
+  pinMode(BUTTON_REFRESH, INPUT);
 
   tft.init();
   tft.setRotation(1);
@@ -1215,15 +1217,24 @@ void setup() {
 }
 
 void loop() {
-  static bool lastState = HIGH;
-  bool state = digitalRead(BUTTON_NEXT);
-  if (state == LOW && lastState == HIGH) {
+  static bool lastNextState = HIGH;
+  bool nextState = digitalRead(BUTTON_NEXT);
+  if (nextState == LOW && lastNextState == HIGH) {
     fetchGeneration++;
     currentStop = (currentStop + 1) % NB_STOPS;
     needsRefresh = true;
     delay(50);
   }
-  lastState = state;
+  lastNextState = nextState;
+
+  static bool lastRefreshState = HIGH;
+  bool refreshState = digitalRead(BUTTON_REFRESH);
+  if (refreshState == LOW && lastRefreshState == HIGH) {
+    fetchGeneration++;
+    needsRefresh = true;
+    delay(50);
+  }
+  lastRefreshState = refreshState;
 
   if (needsRefresh || millis() - lastFetch > FETCH_INTERVAL_MS) {
     if (fetchAndDisplay(stops[currentStop])) {
