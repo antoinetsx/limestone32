@@ -32,7 +32,7 @@
 #define LEON_API_HOST "ecrans-api.gwadz.fr"
 #define FETCH_INTERVAL_MS 60000
 #define TLS_TIMEOUT_SEC 12
-// Leon/Cloudflare omits Content-Length; HTTP/1.0 + getString() reads until close (~100 KB max hub).
+// Leon/Cloudflare omits Content-Length; HTTP/1.0 needs manual stream read (~100 KB max hub).
 // --- Layout (240x135 landscape, rotation 1) ---
 static const int SCREEN_W = 240;
 static const int SCREEN_H = 135;
@@ -313,8 +313,8 @@ bool syncNetworkTime() {
   return false;
 }
 
-// Buffer the full body via getString() then parse. HTTP/1.0 avoids chunked encoding;
-// stream deserialize races the socket and yields IncompleteInput on large RER hubs (~96 KB).
+// Buffer the full body from the TLS stream then parse. HTTP/1.0 avoids chunked encoding;
+// HTTPClient::getString() stops early (~63 KB) on large RER hubs (~97 KB).
 DeserializationError fetchDeparturesJson(const char *host, const String &path, JsonDocument &doc,
                                          const JsonDocument &filterDoc, int &httpCode,
                                          String &errorMsg, int &responseBytes) {
@@ -354,11 +354,29 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
 
   const int contentLength = http.getSize();
 
+  WiFiClient *stream = http.getStreamPtr();
   String payload;
   if (contentLength > 0) {
     payload.reserve((size_t)contentLength + 1);
+  } else {
+    payload.reserve(98304);
   }
-  payload = http.getString();
+
+  const unsigned long bodyDeadline = millis() + 30000;
+  uint8_t buf[512];
+  while (http.connected() || (stream != nullptr && stream->available())) {
+    if (millis() > bodyDeadline) {
+      break;
+    }
+    if (stream != nullptr && stream->available()) {
+      const int n = stream->readBytes(buf, sizeof(buf));
+      if (n > 0) {
+        payload.concat(reinterpret_cast<const char *>(buf), (unsigned)n);
+      }
+    } else {
+      delay(1);
+    }
+  }
   http.end();
   responseBytes = (int)payload.length();
 
