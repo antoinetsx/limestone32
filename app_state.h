@@ -70,5 +70,4 @@ void abortActiveFetchClient();
 void releaseActiveFetchClient(WiFiClientSecure &client);
 void pollNavigationButtons();
 void rotateToNextStop();
-void resetStopRotationTimer();
 void delayUnlessStale(uint32_t generation, unsigned long ms);

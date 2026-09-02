@@ -84,7 +84,6 @@ void loop() {
     if (fetchAndDisplay(currentStop)) {
       lastFetch = millis();
       needsRefresh = false;
-      lastStopShownAt = millis();
     }
   }
 }

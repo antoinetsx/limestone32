@@ -50,10 +50,6 @@ void rotateToNextStop() {
   lastStopShownAt = millis();
 }
 
-void resetStopRotationTimer() {
-  lastStopShownAt = millis();
-}
-
 // Poll NEXT/REFRESH during blocking fetch I/O so stop switches are instant.
 void pollNavigationButtons() {
   static bool lastNextState = HIGH;
@@ -75,7 +71,6 @@ void pollNavigationButtons() {
     needsRefresh = true;
     gBoardVisible = false;
     gPendingLoadingDraw = true;
-    resetStopRotationTimer();
     unsigned long debounceStart = millis();
     while (millis() - debounceStart < BUTTON_DEBOUNCE_MS) {
       delay(5);
