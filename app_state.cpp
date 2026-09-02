@@ -2,6 +2,7 @@
 
 int currentStop = 0;
 unsigned long lastFetch = 0;
+unsigned long lastStopShownAt = 0;
 bool needsRefresh = true;
 volatile uint32_t fetchGeneration = 0;
 WiFiClientSecure *gActiveFetchClient = nullptr;
@@ -39,17 +40,26 @@ void releaseActiveFetchClient(WiFiClientSecure &client) {
   client.stop();
 }
 
+void rotateToNextStop() {
+  fetchGeneration++;
+  abortActiveFetchClient();
+  currentStop = (currentStop + 1) % NB_STOPS;
+  needsRefresh = true;
+  gBoardVisible = false;
+  gPendingLoadingDraw = true;
+  lastStopShownAt = millis();
+}
+
+void resetStopRotationTimer() {
+  lastStopShownAt = millis();
+}
+
 // Poll NEXT/REFRESH during blocking fetch I/O so stop switches are instant.
 void pollNavigationButtons() {
   static bool lastNextState = HIGH;
   bool nextState = digitalRead(BUTTON_NEXT);
   if (nextState == LOW && lastNextState == HIGH) {
-    fetchGeneration++;
-    abortActiveFetchClient();
-    currentStop = (currentStop + 1) % NB_STOPS;
-    needsRefresh = true;
-    gBoardVisible = false;
-    gPendingLoadingDraw = true;
+    rotateToNextStop();
     unsigned long debounceStart = millis();
     while (millis() - debounceStart < BUTTON_DEBOUNCE_MS) {
       delay(5);
@@ -65,6 +75,7 @@ void pollNavigationButtons() {
     needsRefresh = true;
     gBoardVisible = false;
     gPendingLoadingDraw = true;
+    resetStopRotationTimer();
     unsigned long debounceStart = millis();
     while (millis() - debounceStart < BUTTON_DEBOUNCE_MS) {
       delay(5);

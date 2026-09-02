@@ -11,6 +11,7 @@
 #define TFT_BACKLIGHT   4
 #define LEON_API_HOST   "ecrans-api.gwadz.fr"
 #define FETCH_INTERVAL_MS 30000
+#define STOP_ROTATE_INTERVAL_MS 120000
 #define TLS_TIMEOUT_SEC   30
 #define CONNECT_ATTEMPT_MS 3000
 #define BUTTON_DEBOUNCE_MS 50
@@ -43,6 +44,7 @@ struct LineTheme {
 
 extern int currentStop;
 extern unsigned long lastFetch;
+extern unsigned long lastStopShownAt;
 extern bool needsRefresh;
 extern volatile uint32_t fetchGeneration;
 extern WiFiClientSecure *gActiveFetchClient;
@@ -67,4 +69,6 @@ bool isFetchStale(uint32_t generation);
 void abortActiveFetchClient();
 void releaseActiveFetchClient(WiFiClientSecure &client);
 void pollNavigationButtons();
+void rotateToNextStop();
+void resetStopRotationTimer();
 void delayUnlessStale(uint32_t generation, unsigned long ms);
