@@ -14,7 +14,6 @@
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <HTTPClient.h>
 #include <time.h>
 #include <sys/time.h>
 #include <math.h>
@@ -33,8 +32,11 @@
 #define LEON_API_HOST "ecrans-api.gwadz.fr"
 #define FETCH_INTERVAL_MS 60000
 #define TLS_TIMEOUT_SEC 30
+#define CONNECT_ATTEMPT_MS 3000
 #define BODY_IDLE_MS 2000
 #define BODY_MAX_MS 60000
+#define HTTP_READ_CHUNK 256
+#define MAX_HTTP_REDIRECTS 3
 // Leon/Cloudflare omits Content-Length; HTTP/1.0 needs manual stream read (~100 KB max hub).
 // --- Layout (240x135 landscape, rotation 1) ---
 static const int SCREEN_W = 240;
@@ -97,6 +99,7 @@ int currentStop = 0;
 unsigned long lastFetch = 0;
 bool needsRefresh = true;
 volatile uint32_t fetchGeneration = 0;
+WiFiClientSecure *gActiveFetchClient = nullptr;
 
 uint16_t gColorDestText;
 uint16_t gColorTimeYellow;
@@ -159,16 +162,33 @@ bool isFetchStale(uint32_t generation) {
   return generation != fetchGeneration;
 }
 
+void abortActiveFetchClient() {
+  if (gActiveFetchClient != nullptr) {
+    gActiveFetchClient->stop();
+  }
+}
+
+void releaseActiveFetchClient(WiFiClientSecure &client) {
+  if (gActiveFetchClient == &client) {
+    gActiveFetchClient = nullptr;
+  }
+  client.stop();
+}
+
 // Poll NEXT/REFRESH during blocking fetch I/O so stop switches are instant.
 void pollNavigationButtons() {
   static bool lastNextState = HIGH;
   bool nextState = digitalRead(BUTTON_NEXT);
   if (nextState == LOW && lastNextState == HIGH) {
     fetchGeneration++;
+    abortActiveFetchClient();
     currentStop = (currentStop + 1) % NB_STOPS;
     needsRefresh = true;
     drawLoadingScreen(stops[currentStop]);
-    delay(50);
+    unsigned long debounceStart = millis();
+    while (millis() - debounceStart < 50) {
+      delay(5);
+    }
   }
   lastNextState = nextState;
 
@@ -176,9 +196,13 @@ void pollNavigationButtons() {
   bool refreshState = digitalRead(BUTTON_REFRESH);
   if (refreshState == LOW && lastRefreshState == HIGH) {
     fetchGeneration++;
+    abortActiveFetchClient();
     needsRefresh = true;
     drawLoadingScreen(stops[currentStop]);
-    delay(50);
+    unsigned long debounceStart = millis();
+    while (millis() - debounceStart < 50) {
+      delay(5);
+    }
   }
   lastRefreshState = refreshState;
 }
@@ -382,7 +406,14 @@ class IdleCountingStream : public Stream {
 
       const int avail = _source->available();
       if (avail > 0) {
-        const size_t n = _source->readBytes(buffer + total, length - total);
+        size_t chunk = length - total;
+        if (chunk > (size_t)avail) {
+          chunk = (size_t)avail;
+        }
+        if (chunk > HTTP_READ_CHUNK) {
+          chunk = HTTP_READ_CHUNK;
+        }
+        const size_t n = _source->readBytes(buffer + total, chunk);
         if (n > 0) {
           total += n;
           _count += n;
@@ -448,6 +479,166 @@ static size_t drainStreamIdle(Stream *stream, size_t alreadyRead, char *stopReas
   return total;
 }
 
+int parseHttpStatusLine(const char *line) {
+  if (line == nullptr || strncmp(line, "HTTP/", 5) != 0) {
+    return 0;
+  }
+  const char *cursor = strchr(line, ' ');
+  if (cursor == nullptr) {
+    return 0;
+  }
+  while (*cursor == ' ') {
+    cursor++;
+  }
+  return atoi(cursor);
+}
+
+bool readPollLine(Stream *stream, char *line, size_t lineLen, size_t &outLen, uint32_t generation,
+                  unsigned long deadline, bool &aborted) {
+  outLen = 0;
+  aborted = false;
+  if (lineLen == 0) {
+    return false;
+  }
+
+  while (millis() < deadline) {
+    pollNavigationButtons();
+    if (isFetchStale(generation)) {
+      aborted = true;
+      return false;
+    }
+
+    while (stream->available() > 0) {
+      int c = stream->read();
+      if (c < 0) {
+        break;
+      }
+      if (c == '\n') {
+        if (outLen > 0 && line[outLen - 1] == '\r') {
+          outLen--;
+        }
+        line[outLen] = '\0';
+        return true;
+      }
+      if (outLen + 1 < lineLen) {
+        line[outLen++] = (char)c;
+      }
+    }
+    delay(1);
+  }
+
+  return false;
+}
+
+bool connectTlsPoll(WiFiClientSecure &client, const char *host, uint32_t generation,
+                    String &errorMsg) {
+  const unsigned long connectDeadline = millis() + TLS_TIMEOUT_SEC * 1000UL;
+  while (millis() < connectDeadline) {
+    pollNavigationButtons();
+    if (isFetchStale(generation)) {
+      errorMsg = "Aborted";
+      return false;
+    }
+    if (client.connect(host, 443, CONNECT_ATTEMPT_MS)) {
+      return true;
+    }
+    delay(10);
+  }
+
+  errorMsg = "TLS connect failed";
+  return false;
+}
+
+bool sendHttpGetRequest(WiFiClientSecure &client, const char *host, const String &path) {
+  client.print("GET ");
+  client.print(path);
+  client.print(" HTTP/1.0\r\n");
+  client.print("Host: ");
+  client.print(host);
+  client.print("\r\n");
+  client.print("Accept: application/json\r\n");
+  client.print("Accept-Encoding: identity\r\n");
+  client.print("User-Agent: bus-display-esp32/2.0\r\n");
+  client.print("Connection: close\r\n");
+  client.print("\r\n");
+  return true;
+}
+
+enum ReadHeadersResult : uint8_t {
+  HEADERS_OK,
+  HEADERS_ABORTED,
+  HEADERS_TIMEOUT,
+  HEADERS_ERROR,
+};
+
+ReadHeadersResult readHttpResponseHeaders(Stream *stream, int &httpCode, int &contentLength,
+                                          char *location, size_t locationLen, uint32_t generation) {
+  httpCode = 0;
+  contentLength = -1;
+  if (location != nullptr && locationLen > 0) {
+    location[0] = '\0';
+  }
+
+  const unsigned long deadline = millis() + TLS_TIMEOUT_SEC * 1000UL;
+  char line[320];
+  size_t lineLen = 0;
+  bool gotStatus = false;
+
+  while (true) {
+    bool aborted = false;
+    if (!readPollLine(stream, line, sizeof(line), lineLen, generation, deadline, aborted)) {
+      if (aborted || isFetchStale(generation)) {
+        return HEADERS_ABORTED;
+      }
+      return HEADERS_TIMEOUT;
+    }
+
+    if (!gotStatus) {
+      httpCode = parseHttpStatusLine(line);
+      gotStatus = true;
+      if (httpCode == 0) {
+        return HEADERS_ERROR;
+      }
+      continue;
+    }
+
+    if (lineLen == 0) {
+      return HEADERS_OK;
+    }
+
+    if (strncasecmp(line, "Content-Length:", 15) == 0) {
+      contentLength = atoi(line + 15);
+    } else if (location != nullptr && locationLen > 0 && strncasecmp(line, "Location:", 9) == 0) {
+      const char *value = line + 9;
+      while (*value == ' ') {
+        value++;
+      }
+      strncpy(location, value, locationLen - 1);
+      location[locationLen - 1] = '\0';
+    }
+  }
+}
+
+String pathFromRedirectLocation(const char *location) {
+  if (location == nullptr || location[0] == '\0') {
+    return String();
+  }
+  if (location[0] == '/') {
+    return String(location);
+  }
+  if (strncmp(location, "https://", 8) == 0) {
+    const char *pathStart = strchr(location + 8, '/');
+    if (pathStart != nullptr) {
+      return String(pathStart);
+    }
+  }
+  return String();
+}
+
+bool isRedirectStatus(int httpCode) {
+  return httpCode == 301 || httpCode == 302 || httpCode == 307 || httpCode == 308;
+}
+
 // Parse JSON straight from the TLS stream. HTTP/1.0 avoids chunked encoding.
 // Skips buffering ~100 KB into a String (which OOM'd around 64 KB on RER hubs).
 DeserializationError fetchDeparturesJson(const char *host, const String &path, JsonDocument &doc,
@@ -462,86 +653,84 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
   }
 
   WiFiClientSecure client;
+  gActiveFetchClient = &client;
   client.setInsecure();
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
-  client.setConnectionTimeout(TLS_TIMEOUT_SEC * 1000UL);
+  client.setConnectionTimeout(CONNECT_ATTEMPT_MS);
 #else
-  client.setTimeout(TLS_TIMEOUT_SEC);
+  client.setTimeout(1);
 #endif
   client.setHandshakeTimeout(15);
 
-  const unsigned long connectDeadline = millis() + TLS_TIMEOUT_SEC * 1000UL;
-  while (millis() < connectDeadline) {
-    pollNavigationButtons();
+  if (!connectTlsPoll(client, host, generation, errorMsg)) {
+    httpCode = 0;
+    releaseActiveFetchClient(client);
+    return DeserializationError::EmptyInput;
+  }
+
+  String requestPath = path;
+  int contentLength = -1;
+  char location[256];
+
+  for (int redirect = 0; redirect <= MAX_HTTP_REDIRECTS; redirect++) {
     if (isFetchStale(generation)) {
       errorMsg = "Aborted";
       httpCode = 0;
+      releaseActiveFetchClient(client);
       return DeserializationError::EmptyInput;
     }
-    if (client.connect(host, 443)) {
-      break;
+
+    if (!client.connected() && !connectTlsPoll(client, host, generation, errorMsg)) {
+      httpCode = 0;
+      releaseActiveFetchClient(client);
+      return DeserializationError::EmptyInput;
     }
-    delay(10);
-  }
-  if (!client.connected()) {
-    errorMsg = "TLS connect failed";
-    httpCode = 0;
-    return DeserializationError::EmptyInput;
-  }
 
-  HTTPClient http;
-  String url = String("https://") + host + path;
-  if (!http.begin(client, url)) {
-    errorMsg = "HTTP init failed";
-    httpCode = 0;
-    client.stop();
-    return DeserializationError::EmptyInput;
-  }
+    sendHttpGetRequest(client, host, requestPath);
 
-  http.setTimeout(TLS_TIMEOUT_SEC * 1000);
-  http.setReuse(false);
-  http.useHTTP10(true);
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.addHeader("Accept", "application/json");
-  http.addHeader("Accept-Encoding", "identity");
-  http.addHeader("User-Agent", "bus-display-esp32/2.0");
+    ReadHeadersResult headerResult =
+        readHttpResponseHeaders(&client, httpCode, contentLength, location, sizeof(location),
+                                generation);
+    if (headerResult == HEADERS_ABORTED || isFetchStale(generation)) {
+      errorMsg = "Aborted";
+      httpCode = 0;
+      releaseActiveFetchClient(client);
+      return DeserializationError::EmptyInput;
+    }
+    if (headerResult != HEADERS_OK) {
+      errorMsg = (headerResult == HEADERS_TIMEOUT) ? "Header timeout" : "Bad HTTP headers";
+      httpCode = 0;
+      releaseActiveFetchClient(client);
+      return DeserializationError::EmptyInput;
+    }
 
-  if (isFetchStale(generation)) {
-    errorMsg = "Aborted";
-    httpCode = 0;
-    http.end();
-    return DeserializationError::EmptyInput;
-  }
-
-  httpCode = http.GET();
-  if (isFetchStale(generation)) {
-    errorMsg = "Aborted";
-    httpCode = 0;
-    http.end();
-    return DeserializationError::EmptyInput;
-  }
-
-  if (httpCode <= 0) {
-    errorMsg = http.errorToString(httpCode);
-    http.end();
-    return DeserializationError::EmptyInput;
+    if (isRedirectStatus(httpCode)) {
+      String nextPath = pathFromRedirectLocation(location);
+      if (nextPath.length() == 0 || redirect >= MAX_HTTP_REDIRECTS) {
+        errorMsg = "HTTP redirect failed";
+        releaseActiveFetchClient(client);
+        return DeserializationError::EmptyInput;
+      }
+      requestPath = nextPath;
+      releaseActiveFetchClient(client);
+      gActiveFetchClient = &client;
+      if (!connectTlsPoll(client, host, generation, errorMsg)) {
+        httpCode = 0;
+        releaseActiveFetchClient(client);
+        return DeserializationError::EmptyInput;
+      }
+      continue;
+    }
+    break;
   }
 
-  if (httpCode != HTTP_CODE_OK) {
+  if (httpCode != 200) {
     errorMsg = "HTTP " + String(httpCode);
-    http.end();
+    releaseActiveFetchClient(client);
     return DeserializationError::EmptyInput;
   }
 
-  const int contentLength = http.getSize();
-  WiFiClient *stream = http.getStreamPtr();
-  if (stream == nullptr) {
-    errorMsg = "No response stream";
-    http.end();
-    return DeserializationError::EmptyInput;
-  }
-
-  IdleCountingStream bodyStream(stream, BODY_MAX_MS, generation);
+  IdleCountingStream bodyStream(&client, BODY_MAX_MS, generation);
   const DeserializationError err =
       deserializeJson(doc, bodyStream, DeserializationOption::Filter(filterDoc));
 
@@ -549,24 +738,24 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
   size_t totalBytes = bodyStream.byteCount();
   if (isFetchStale(generation)) {
     strncpy(stopReason, "aborted", sizeof(stopReason));
-    http.end();
     errorMsg = "Aborted";
     responseBytes = (int)totalBytes;
+    releaseActiveFetchClient(client);
     return DeserializationError::EmptyInput;
   }
 
   if (err == DeserializationError::Ok) {
     strncpy(stopReason, "complete", sizeof(stopReason));
   } else if (err == DeserializationError::IncompleteInput) {
-    totalBytes = drainStreamIdle(stream, totalBytes, stopReason, sizeof(stopReason), generation);
-  } else if (stream->available() > 0) {
-    totalBytes = drainStreamIdle(stream, totalBytes, stopReason, sizeof(stopReason), generation);
+    totalBytes = drainStreamIdle(&client, totalBytes, stopReason, sizeof(stopReason), generation);
+  } else if (client.available() > 0) {
+    totalBytes = drainStreamIdle(&client, totalBytes, stopReason, sizeof(stopReason), generation);
   } else {
     strncpy(stopReason, "parse_error", sizeof(stopReason));
   }
 
-  http.end();
   responseBytes = (int)totalBytes;
+  releaseActiveFetchClient(client);
 
   if (isFetchStale(generation)) {
     errorMsg = "Aborted";
@@ -1180,7 +1369,7 @@ bool fetchAndDisplay(Stop &stop) {
     return !isFetchStale(generation);
   }
 
-  if (httpCode != HTTP_CODE_OK) {
+  if (httpCode != 200) {
     drawErrorScreen(stop, "HTTP error", String(httpCode) + " - " + errorMsg);
     return !isFetchStale(generation);
   }
@@ -1215,6 +1404,11 @@ bool fetchAndDisplay(Stop &stop) {
   int skippedPast = 0;
 
   for (JsonObject departure : departures) {
+    pollNavigationButtons();
+    if (isFetchStale(generation)) {
+      return false;
+    }
+
     const char *branchRef = departure["branchRef"] | "";
     const char *lineRef = departure["lineRef"] | "";
     const char *dateTime = departure["dateTime"] | "";
