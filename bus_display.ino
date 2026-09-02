@@ -312,7 +312,10 @@ bool syncNetworkTime() {
   return false;
 }
 
-bool fetchHttpsGet(const char *host, const String &path, String &body, int &httpCode, String &errorMsg) {
+// Parse departures JSON directly from the HTTPS stream (avoids getString() truncation on large hub responses).
+DeserializationError fetchDeparturesJson(const char *host, const String &path, JsonDocument &doc,
+                                         const JsonDocument &filterDoc, int &httpCode,
+                                         String &errorMsg) {
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(TLS_TIMEOUT_SEC * 1000);
@@ -322,10 +325,12 @@ bool fetchHttpsGet(const char *host, const String &path, String &body, int &http
   String url = String("https://") + host + path;
   if (!http.begin(client, url)) {
     errorMsg = "HTTP init failed";
-    return false;
+    httpCode = 0;
+    return DeserializationError::EmptyInput;
   }
 
   http.setTimeout(TLS_TIMEOUT_SEC * 1000);
+  http.setReuse(false);
   http.addHeader("Accept", "application/json");
   http.addHeader("User-Agent", "bus-display-esp32/2.0");
 
@@ -333,12 +338,26 @@ bool fetchHttpsGet(const char *host, const String &path, String &body, int &http
   if (httpCode <= 0) {
     errorMsg = http.errorToString(httpCode);
     http.end();
-    return false;
+    return DeserializationError::EmptyInput;
   }
 
-  body = http.getString();
+  if (httpCode != HTTP_CODE_OK) {
+    errorMsg = "HTTP " + String(httpCode);
+    http.end();
+    return DeserializationError::EmptyInput;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  if (stream == nullptr) {
+    errorMsg = "No response stream";
+    http.end();
+    return DeserializationError::EmptyInput;
+  }
+
+  DeserializationError err =
+      deserializeJson(doc, *stream, DeserializationOption::Filter(filterDoc));
   http.end();
-  return body.length() > 0;
+  return err;
 }
 
 const char *lineCodeFromId(const char *lineId) {
@@ -840,15 +859,23 @@ bool fetchAndDisplay(Stop &stop) {
   Serial.print(LEON_API_HOST);
   Serial.println(path);
 
-  String payload;
-  String errorMsg;
+  JsonDocument filterDoc;
+  configureDeparturesFilter(filterDoc);
+
+  JsonDocument doc;
+  DeserializationError err = DeserializationError::EmptyInput;
   int httpCode = 0;
+  String errorMsg;
+
   for (int attempt = 1; attempt <= 2; attempt++) {
     if (isFetchStale(generation)) {
       return false;
     }
 
-    if (fetchHttpsGet(LEON_API_HOST, path, payload, httpCode, errorMsg)) {
+    doc.clear();
+    err = fetchDeparturesJson(LEON_API_HOST, path, doc, filterDoc, httpCode, errorMsg);
+
+    if (err == DeserializationError::Ok && !doc.overflowed()) {
       break;
     }
 
@@ -856,47 +883,37 @@ bool fetchAndDisplay(Stop &stop) {
     Serial.print(attempt);
     Serial.print(" - HTTP ");
     Serial.print(httpCode);
-    Serial.print(" - ");
-    Serial.println(errorMsg);
+    Serial.print(" - JSON ");
+    Serial.println(err.c_str());
 
-    if (attempt < 2) {
-      delayUnlessStale(generation, 1000);
+    const bool retryable = (err == DeserializationError::IncompleteInput ||
+                            err == DeserializationError::NoMemory);
+    if (!retryable || attempt >= 2) {
+      break;
     }
+
+    delayUnlessStale(generation, 1000);
   }
 
   if (isFetchStale(generation)) {
     return false;
   }
 
-  if (payload.length() == 0) {
-    String detail = "HTTP " + String(httpCode);
-    if (errorMsg.length() > 0) {
-      detail += " - " + errorMsg;
-    }
+  if (httpCode <= 0) {
+    String detail = errorMsg.length() > 0 ? errorMsg : "Connection failed";
     drawErrorScreen(stop, "HTTPS error", detail);
     return !isFetchStale(generation);
   }
 
-  if (httpCode != 200) {
+  if (httpCode != HTTP_CODE_OK) {
     drawErrorScreen(stop, "HTTP error", String(httpCode) + " - " + errorMsg);
     return !isFetchStale(generation);
   }
 
-  JsonDocument filterDoc;
-  configureDeparturesFilter(filterDoc);
-
-  JsonDocument doc;
-  DeserializationError err =
-      deserializeJson(doc, payload, DeserializationOption::Filter(filterDoc));
   if (err || doc.overflowed()) {
     String detail = err ? String(err.c_str()) : "overflow";
-    detail += " (";
-    detail += payload.length();
-    detail += " bytes)";
     drawErrorScreen(stop, "JSON error", detail);
     Serial.println(err ? err.c_str() : "JsonDocument overflow");
-    Serial.print("Payload bytes: ");
-    Serial.println(payload.length());
     return !isFetchStale(generation);
   }
 
