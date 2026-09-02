@@ -174,6 +174,11 @@ static bool connectTlsPoll(WiFiClientSecure &client, const char *host, uint32_t 
       return false;
     }
     if (client.connect(host, 443, CONNECT_ATTEMPT_MS)) {
+      pollNavigationButtons();
+      if (isFetchStale(generation)) {
+        errorMsg = "Aborted";
+        return false;
+      }
       return true;
     }
     delay(10);

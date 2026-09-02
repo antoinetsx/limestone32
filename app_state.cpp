@@ -118,6 +118,10 @@ void pollNavigationButtons() {
     }
   }
   lastRefreshState = refreshState;
+
+  if (millis() - lastStopShownAt >= STOP_ROTATE_INTERVAL_MS) {
+    rotateToNextStop();
+  }
 }
 
 void delayUnlessStale(uint32_t generation, unsigned long ms) {

@@ -76,10 +76,6 @@ void loop() {
 
   updateMinuteCountdown();
 
-  if (millis() - lastStopShownAt >= STOP_ROTATE_INTERVAL_MS) {
-    rotateToNextStop();
-  }
-
   if (!ensureWifiConnected()) {
     static unsigned long lastWifiErrorDraw = 0;
     if (millis() - lastWifiErrorDraw > 5000 || gLastDrawnStopIndex != currentStop ||
@@ -88,10 +84,14 @@ void loop() {
       lastWifiErrorDraw = millis();
       gBoardVisible = false;
     }
-  } else if (needsRefresh || millis() - lastFetch > FETCH_INTERVAL_MS) {
-    if (fetchAndDisplay(currentStop)) {
-      lastFetch = millis();
-      needsRefresh = false;
+  } else if (needsRefresh || gShowingLoading || millis() - lastFetch > FETCH_INTERVAL_MS) {
+    const int fetchedStop = currentStop;
+    const uint32_t generation = fetchGeneration;
+    if (fetchAndDisplay(fetchedStop)) {
+      if (!isFetchStale(generation) && currentStop == fetchedStop) {
+        lastFetch = millis();
+        needsRefresh = false;
+      }
     }
   }
 }

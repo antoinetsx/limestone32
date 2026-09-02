@@ -264,6 +264,7 @@ void drawDepartureBoard(int stopIndex, const DepartureRow *rows, int count, bool
     drawMinutesCell(ROW2_Y, -1);
   }
 
+  gPendingLoadingDraw = false;
   gShowingLoading = false;
 }
 
@@ -283,6 +284,8 @@ void drawLoadingScreen(int stopIndex) {
   tft.setTextSize(2);
   tft.setCursor(DEST_PAD_X, ROW1_Y + 14);
   tft.print("Loading...");
+  gPendingLoadingDraw = false;
+  gBoardVisible = false;
   gShowingLoading = true;
 }
 
@@ -305,6 +308,7 @@ void drawErrorScreen(int stopIndex, const char *title, const String &detail) {
   tft.setTextSize(1);
   tft.setCursor(DEST_PAD_X, ROW1_Y + 28);
   tft.println(stripAccents(detail));
+  gPendingLoadingDraw = false;
   gShowingLoading = false;
 }
 

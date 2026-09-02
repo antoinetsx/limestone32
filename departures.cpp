@@ -439,12 +439,16 @@ bool fetchAndDisplay(int stopIndex) {
   Serial.print(" past=");
   Serial.println(skippedPast);
 
-  if (isFetchStale(generation)) {
+  if (isFetchStale(generation) || currentStop != stopIndex) {
     return false;
   }
 
   const bool keepHeader = (gLastDrawnStopIndex == stopIndex && gShowingLoading);
   drawDepartureBoard(stopIndex, rows, shown, keepHeader);
+
+  if (isFetchStale(generation) || currentStop != stopIndex) {
+    return false;
+  }
 
   for (int i = 0; i < shown; i++) {
     gDisplayedRows[i] = rows[i];
