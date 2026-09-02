@@ -28,6 +28,14 @@ static const int STATION_X_BUS = BADGE_X + BADGE_BUS_W + BADGE_GAP;
 static const int STATION_TEXT_SIZE = 2;
 static const int STATION_TEXT_H = 8 * STATION_TEXT_SIZE;
 static const int STATION_Y = BADGE_CENTER_Y - STATION_TEXT_H / 2;
+static const int STOP_INDICATOR_MARGIN = 6;
+static const int STOP_DOTS_PER_ROW_MAX = 4;
+static const int STOP_DOT_SPACING = 8;
+static const int STOP_DOT_ROW_GAP = 8;
+static const int STOP_DOT_ACTIVE_R = 4;
+static const int STOP_DOT_INACTIVE_R = 2;
+static const int STOP_INDICATOR_ZONE_W =
+    (STOP_DOTS_PER_ROW_MAX - 1) * STOP_DOT_SPACING + STOP_DOT_ACTIVE_R * 2;
 static const int MINUTES_NUM_SIZE = 3;
 static const int MINUTES_SUFFIX_SIZE = 1;
 static const int DEST_PAD_X = 5;

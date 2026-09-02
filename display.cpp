@@ -89,17 +89,63 @@ static void drawLineBadge(const LineTheme &theme) {
   }
 }
 
-static void drawHeader(const Stop &stop, const LineTheme &theme) {
+static int stopDotsPerRow() {
+  return STOP_DOTS_PER_ROW_MAX;
+}
+
+static int stopDotRows() {
+  const int perRow = stopDotsPerRow();
+  return (NB_STOPS + perRow - 1) / perRow;
+}
+
+static void drawStopDots(int stopIndex) {
+  if (NB_STOPS <= 1) {
+    return;
+  }
+
+  const int perRow = stopDotsPerRow();
+  const int rows = stopDotRows();
+  const int blockSpan = (rows - 1) * STOP_DOT_ROW_GAP;
+  const int firstRowCy = (HEADER_H - blockSpan) / 2;
+  const int rowEndCx = SCREEN_W - STOP_INDICATOR_MARGIN;
+
+  for (int i = 0; i < NB_STOPS; i++) {
+    const int row = i / perRow;
+    const int col = i % perRow;
+    const int rowStart = row * perRow;
+    const int dotsInRow = (rowStart + perRow <= NB_STOPS) ? perRow : (NB_STOPS - rowStart);
+
+    const int cx = rowEndCx - (dotsInRow - 1 - col) * STOP_DOT_SPACING;
+    const int cy = firstRowCy + row * STOP_DOT_ROW_GAP;
+
+    if (i == stopIndex) {
+      tft.fillCircle(cx, cy, STOP_DOT_ACTIVE_R, gColorTimeYellow);
+    } else {
+      tft.fillCircle(cx, cy, STOP_DOT_INACTIVE_R, gColorSepGray);
+    }
+  }
+}
+
+static int stopIndicatorReserve() {
+  if (NB_STOPS <= 1) {
+    return STOP_INDICATOR_MARGIN;
+  }
+  return STOP_INDICATOR_ZONE_W + STOP_INDICATOR_MARGIN;
+}
+
+static void drawHeader(int stopIndex, const Stop &stop, const LineTheme &theme) {
   tft.fillRect(0, 0, SCREEN_W, HEADER_H, TFT_WHITE);
   drawLineBadge(theme);
 
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
   tft.setTextSize(STATION_TEXT_SIZE);
   int stationX = (theme.mode == BADGE_BUS) ? STATION_X_BUS : STATION_X;
-  String station = truncateToWidth(stripAccents(String(stop.label)), SCREEN_W - stationX - 5,
-                                   STATION_TEXT_SIZE);
+  int stationMaxW = SCREEN_W - stationX - stopIndicatorReserve();
+  String station = truncateToWidth(stripAccents(String(stop.label)), stationMaxW, STATION_TEXT_SIZE);
   tft.setCursor(stationX, STATION_Y);
   tft.print(station);
+
+  drawStopDots(stopIndex);
 
   tft.fillRect(0, BODY_Y, SCREEN_W, BORDER_H, theme.accent);
 }
@@ -193,7 +239,7 @@ void drawDepartureBoard(int stopIndex, const DepartureRow *rows, int count, bool
 
   if (!keepHeader) {
     tft.fillScreen(TFT_WHITE);
-    drawHeader(stop, theme);
+    drawHeader(stopIndex, stop, theme);
     gLastDrawnStopIndex = stopIndex;
   } else {
     tft.fillRect(0, CONTENT_Y, LEFT_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
@@ -227,7 +273,7 @@ void drawLoadingScreen(int stopIndex) {
 
   if (gLastDrawnStopIndex != stopIndex) {
     tft.fillScreen(TFT_WHITE);
-    drawHeader(stop, theme);
+    drawHeader(stopIndex, stop, theme);
     gLastDrawnStopIndex = stopIndex;
   } else {
     tft.fillRect(0, CONTENT_Y, SCREEN_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
@@ -246,7 +292,7 @@ void drawErrorScreen(int stopIndex, const char *title, const String &detail) {
 
   if (gLastDrawnStopIndex != stopIndex) {
     tft.fillScreen(TFT_WHITE);
-    drawHeader(stop, theme);
+    drawHeader(stopIndex, stop, theme);
     gLastDrawnStopIndex = stopIndex;
   } else {
     tft.fillRect(0, CONTENT_Y, SCREEN_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
