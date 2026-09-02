@@ -28,13 +28,13 @@ def c_string(value: str) -> str:
 
 def parse_stop_entry(
     raw: str,
-) -> tuple[str, str, str, str, str, str, str, str, str]:
-    """Return label, stopId, lineId, branchHash, destinationFilter, badgeText, badgeColor, badgeMode, badgeTextColor."""
+) -> tuple[str, str, str, str, str, str, str, str]:
+    """Return label, stopId, lineId, branchHash, destinationFilter, badgeText, badgeColor, badgeMode."""
     parts = raw.split("|")
     if len(parts) < 2:
         raise SystemExit(
             "Each STOP_n must use "
-            "label|stopId|lineId|branchHash|destinationFilter|badgeText|badgeColor|badgeMode|badgeTextColor "
+            "label|stopId|lineId|branchHash|destinationFilter|badgeText|badgeColor|badgeMode "
             "or label|full_leon_screen_url"
         )
 
@@ -50,7 +50,6 @@ def parse_stop_entry(
         badge_text = parts[5].strip() if len(parts) >= 6 else ""
         badge_color = parts[6].strip() if len(parts) >= 7 else ""
         badge_mode = parts[7].strip() if len(parts) >= 8 else ""
-        badge_text_color = parts[8].strip() if len(parts) >= 9 else ""
         return (
             label,
             parts[1].strip(),
@@ -60,11 +59,10 @@ def parse_stop_entry(
             badge_text,
             badge_color,
             badge_mode,
-            badge_text_color,
         )
     else:
         raise SystemExit(
-            f"Invalid STOP entry for {label!r}: expected 4-9 pipe fields or a Leon URL"
+            f"Invalid STOP entry for {label!r}: expected 4-8 pipe fields or a Leon URL"
         )
 
     stop_id = query.get("stopId", [""])[0]
@@ -77,7 +75,7 @@ def parse_stop_entry(
             f"Leon URL for {label!r} must include stopId and lineId query params"
         )
 
-    return label, stop_id, line_id, branch_hash, destination_filter, "", "", "", ""
+    return label, stop_id, line_id, branch_hash, destination_filter, "", "", ""
 
 
 def main() -> None:
@@ -93,7 +91,7 @@ def main() -> None:
             raise SystemExit(f"Missing required value: {key}")
 
     stop_count = int(env.get("STOP_COUNT", "0"))
-    stops: list[tuple[str, str, str, str, str, str, str, str, str]] = []
+    stops: list[tuple[str, str, str, str, str, str, str, str]] = []
     for i in range(1, stop_count + 1):
         raw = env.get(f"STOP_{i}")
         if not raw:
@@ -116,7 +114,6 @@ def main() -> None:
         "  const char* badgeText;",
         "  const char* badgeColor;",
         "  const char* badgeMode;",
-        "  const char* badgeTextColor;",
         "};",
         "",
         "Stop stops[] = {",
@@ -131,7 +128,6 @@ def main() -> None:
         badge_text,
         badge_color,
         badge_mode,
-        badge_text_color,
     ) in stops:
         lines.append(
             "  { "
@@ -142,8 +138,7 @@ def main() -> None:
             f"{c_string(destination_filter)}, "
             f"{c_string(badge_text)}, "
             f"{c_string(badge_color)}, "
-            f"{c_string(badge_mode)}, "
-            f"{c_string(badge_text_color)} "
+            f"{c_string(badge_mode)} "
             "},"
         )
 

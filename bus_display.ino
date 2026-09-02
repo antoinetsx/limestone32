@@ -284,12 +284,9 @@ BadgeMode inferBadgeMode(const Stop &stop, const char *code, const char *badgeLa
   return BADGE_BUS;
 }
 
-// Badge label color: explicit badgeTextColor in .env, else WCAG auto-contrast.
+// Badge label color: WCAG auto-contrast against badge background.
 // Bus/RER/metro text sits on badgeColor; tram text sits on the white center band.
-uint16_t textColorForTheme(BadgeMode mode, const Stop &stop, uint32_t accentHex) {
-  if (stop.badgeTextColor != nullptr && stop.badgeTextColor[0] != '\0') {
-    return color565FromHex((uint32_t)strtoul(stop.badgeTextColor, nullptr, 16));
-  }
+uint16_t textColorForTheme(BadgeMode mode, uint32_t accentHex) {
   uint32_t bgHex = (mode == BADGE_TRAM) ? IDFM_TEXT_LIGHT : accentHex;
   return color565FromHex(bestTextColorForBackground(bgHex));
 }
@@ -322,7 +319,7 @@ LineTheme themeForStop(const Stop &stop) {
 
   BadgeMode mode = inferBadgeMode(stop, code, badgeLabel);
   uint16_t accent = color565FromHex(accentHex);
-  uint16_t textColor = textColorForTheme(mode, stop, accentHex);
+  uint16_t textColor = textColorForTheme(mode, accentHex);
 
   return {accent, badgeLabel, mode, textColor};
 }
