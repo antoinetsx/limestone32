@@ -31,7 +31,9 @@
 #define TFT_BACKLIGHT 4
 #define LEON_API_HOST "ecrans-api.gwadz.fr"
 #define FETCH_INTERVAL_MS 60000
-#define TLS_TIMEOUT_SEC 12
+#define TLS_TIMEOUT_SEC 30
+#define BODY_IDLE_MS 2000
+#define BODY_MAX_MS 60000
 // Leon/Cloudflare omits Content-Length; HTTP/1.0 needs manual stream read (~100 KB max hub).
 // --- Layout (240x135 landscape, rotation 1) ---
 static const int SCREEN_W = 240;
@@ -313,16 +315,110 @@ bool syncNetworkTime() {
   return false;
 }
 
-// Buffer the full body from the TLS stream then parse. HTTP/1.0 avoids chunked encoding;
-// HTTPClient::getString() stops early (~63 KB) on large RER hubs (~97 KB).
+// Wrap TLS stream: count bytes and block-read until idle (TLS may outlive http.connected()).
+class IdleCountingStream : public Stream {
+ public:
+  IdleCountingStream(Stream *source, unsigned long maxMs)
+      : _source(source), _count(0), _deadline(millis() + maxMs) {}
+
+  size_t byteCount() const { return _count; }
+
+  int available() override { return _source != nullptr ? _source->available() : 0; }
+
+  int read() override {
+    uint8_t c = 0;
+    return readBytes(reinterpret_cast<char *>(&c), 1) == 1 ? c : -1;
+  }
+
+  int peek() override { return _source != nullptr ? _source->peek() : -1; }
+
+  void flush() override {
+    if (_source != nullptr) {
+      _source->flush();
+    }
+  }
+
+  size_t readBytes(char *buffer, size_t length) override {
+    if (_source == nullptr || length == 0) {
+      return 0;
+    }
+
+    size_t total = 0;
+    unsigned long lastByteMs = millis();
+
+    while (total < length && millis() < _deadline) {
+      const int avail = _source->available();
+      if (avail > 0) {
+        const size_t n = _source->readBytes(buffer + total, length - total);
+        if (n > 0) {
+          total += n;
+          _count += n;
+          lastByteMs = millis();
+          continue;
+        }
+      }
+      if (total > 0 && millis() - lastByteMs >= BODY_IDLE_MS) {
+        break;
+      }
+      delay(1);
+    }
+
+    return total;
+  }
+
+  size_t write(uint8_t) override { return 0; }
+
+ private:
+  Stream *_source;
+  size_t _count;
+  unsigned long _deadline;
+};
+
+// Drain unread TLS bytes until idle (no data for BODY_IDLE_MS) or BODY_MAX_MS elapsed.
+static size_t drainStreamIdle(Stream *stream, size_t alreadyRead, char *stopReason,
+                              size_t stopReasonLen) {
+  if (stream == nullptr) {
+    strncpy(stopReason, "no_stream", stopReasonLen);
+    return alreadyRead;
+  }
+
+  uint8_t buf[512];
+  size_t total = alreadyRead;
+  unsigned long lastByteMs = millis();
+  const unsigned long deadline = millis() + BODY_MAX_MS;
+
+  while (millis() < deadline) {
+    const int avail = stream->available();
+    if (avail > 0) {
+      const int n = stream->readBytes(buf, sizeof(buf));
+      if (n > 0) {
+        total += (size_t)n;
+        lastByteMs = millis();
+        continue;
+      }
+    }
+    if (millis() - lastByteMs >= BODY_IDLE_MS) {
+      strncpy(stopReason, "idle", stopReasonLen);
+      return total;
+    }
+    delay(1);
+  }
+
+  strncpy(stopReason, "timeout", stopReasonLen);
+  return total;
+}
+
+// Parse JSON straight from the TLS stream. HTTP/1.0 avoids chunked encoding.
+// Skips buffering ~100 KB into a String (which OOM'd around 64 KB on RER hubs).
 DeserializationError fetchDeparturesJson(const char *host, const String &path, JsonDocument &doc,
                                          const JsonDocument &filterDoc, int &httpCode,
                                          String &errorMsg, int &responseBytes) {
   responseBytes = 0;
   WiFiClientSecure client;
   client.setInsecure();
+  client.setBufferSizes(16384, 512);
   client.setTimeout(TLS_TIMEOUT_SEC * 1000);
-  client.setHandshakeTimeout(TLS_TIMEOUT_SEC);
+  client.setHandshakeTimeout(15);
 
   HTTPClient http;
   String url = String("https://") + host + path;
@@ -337,6 +433,7 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
   http.useHTTP10(true);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.addHeader("Accept", "application/json");
+  http.addHeader("Accept-Encoding", "identity");
   http.addHeader("User-Agent", "bus-display-esp32/2.0");
 
   httpCode = http.GET();
@@ -353,49 +450,50 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
   }
 
   const int contentLength = http.getSize();
-
   WiFiClient *stream = http.getStreamPtr();
-  String payload;
-  if (contentLength > 0) {
-    payload.reserve((size_t)contentLength + 1);
+  if (stream == nullptr) {
+    errorMsg = "No response stream";
+    http.end();
+    return DeserializationError::EmptyInput;
+  }
+
+  IdleCountingStream bodyStream(stream, BODY_MAX_MS);
+  const DeserializationError err =
+      deserializeJson(doc, bodyStream, DeserializationOption::Filter(filterDoc));
+
+  char stopReason[12] = "complete";
+  size_t totalBytes = bodyStream.byteCount();
+  if (err == DeserializationError::Ok) {
+    strncpy(stopReason, "complete", sizeof(stopReason));
+  } else if (err == DeserializationError::IncompleteInput) {
+    totalBytes = drainStreamIdle(stream, totalBytes, stopReason, sizeof(stopReason));
+  } else if (stream->available() > 0) {
+    totalBytes = drainStreamIdle(stream, totalBytes, stopReason, sizeof(stopReason));
   } else {
-    payload.reserve(98304);
+    strncpy(stopReason, "parse_error", sizeof(stopReason));
   }
 
-  const unsigned long bodyDeadline = millis() + 30000;
-  uint8_t buf[512];
-  while (http.connected() || (stream != nullptr && stream->available())) {
-    if (millis() > bodyDeadline) {
-      break;
-    }
-    if (stream != nullptr && stream->available()) {
-      const int n = stream->readBytes(buf, sizeof(buf));
-      if (n > 0) {
-        payload.concat(reinterpret_cast<const char *>(buf), (unsigned)n);
-      }
-    } else {
-      delay(1);
-    }
-  }
   http.end();
-  responseBytes = (int)payload.length();
+  responseBytes = (int)totalBytes;
 
-  Serial.print("Fetch: buffered ");
+  Serial.print("Fetch: read ");
   Serial.print(responseBytes);
   Serial.print(" bytes (Content-Length: ");
-  if (contentLength >= 0) {
+  if (contentLength > 0) {
     Serial.print(contentLength);
   } else {
     Serial.print("unknown");
   }
+  Serial.print(", stopped: ");
+  Serial.print(stopReason);
   Serial.println(")");
 
-  if (payload.length() == 0) {
+  if (totalBytes == 0) {
     errorMsg = "Empty response";
     return DeserializationError::EmptyInput;
   }
 
-  return deserializeJson(doc, payload, DeserializationOption::Filter(filterDoc));
+  return err;
 }
 
 const char *lineCodeFromId(const char *lineId) {
@@ -932,7 +1030,8 @@ bool fetchAndDisplay(Stop &stop) {
     }
     Serial.println();
 
-    const bool retryable = (err == DeserializationError::NoMemory);
+    const bool retryable =
+        (err == DeserializationError::NoMemory || err == DeserializationError::IncompleteInput);
     if (!retryable || attempt >= 2) {
       break;
     }
