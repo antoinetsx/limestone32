@@ -810,15 +810,16 @@ void configureDeparturesFilter(JsonDocument &filter) {
   filter.clear();
   filter["error"] = true;
   filter["message"] = true;
-  filter["departures"]["*"]["branchRef"] = true;
-  filter["departures"]["*"]["lineRef"] = true;
-  filter["departures"]["*"]["dateTime"] = true;
-  filter["departures"]["*"]["isAtStop"] = true;
-  filter["departures"]["*"]["shortDestinationLabel"] = true;
-  filter["departures"]["*"]["destinationLabel"] = true;
-  filter["departures"]["*"]["directionName"] = true;
-  filter["departures"]["*"]["destinationStopPointLabel"] = true;
-  filter["departures"]["*"]["flags"] = true;
+  // Index 0 is the template for all departures[] elements (ArduinoJson v7).
+  filter["departures"][0]["branchRef"] = true;
+  filter["departures"][0]["lineRef"] = true;
+  filter["departures"][0]["dateTime"] = true;
+  filter["departures"][0]["isAtStop"] = true;
+  filter["departures"][0]["shortDestinationLabel"] = true;
+  filter["departures"][0]["destinationLabel"] = true;
+  filter["departures"][0]["directionName"] = true;
+  filter["departures"][0]["destinationStopPointLabel"] = true;
+  filter["departures"][0]["flags"] = true;
 }
 
 // Returns true when the board was drawn; false when superseded by a stop switch.
@@ -887,13 +888,13 @@ bool fetchAndDisplay(Stop &stop) {
   JsonDocument doc;
   DeserializationError err =
       deserializeJson(doc, payload, DeserializationOption::Filter(filterDoc));
-  if (err) {
-    String detail = String(err.c_str());
+  if (err || doc.overflowed()) {
+    String detail = err ? String(err.c_str()) : "overflow";
     detail += " (";
     detail += payload.length();
     detail += " bytes)";
     drawErrorScreen(stop, "JSON error", detail);
-    Serial.println(err.c_str());
+    Serial.println(err ? err.c_str() : "JsonDocument overflow");
     Serial.print("Payload bytes: ");
     Serial.println(payload.length());
     return !isFetchStale(generation);
