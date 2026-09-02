@@ -163,6 +163,123 @@ String urlEncode(const String &value) {
   return encoded;
 }
 
+bool utf8Decode(const String &s, size_t &i, uint32_t &cp) {
+  if (i >= s.length()) {
+    return false;
+  }
+
+  uint8_t c = (uint8_t)s.charAt(i);
+  if (c < 0x80) {
+    cp = c;
+    i++;
+    return true;
+  }
+
+  if ((c & 0xE0) == 0xC0 && i + 1 < s.length()) {
+    uint8_t c2 = (uint8_t)s.charAt(i + 1);
+    if ((c2 & 0xC0) != 0x80) {
+      cp = c;
+      i++;
+      return true;
+    }
+    cp = ((uint32_t)(c & 0x1F) << 6) | (c2 & 0x3F);
+    i += 2;
+    return true;
+  }
+
+  if ((c & 0xF0) == 0xE0 && i + 2 < s.length()) {
+    uint8_t c2 = (uint8_t)s.charAt(i + 1);
+    uint8_t c3 = (uint8_t)s.charAt(i + 2);
+    if ((c2 & 0xC0) != 0x80 || (c3 & 0xC0) != 0x80) {
+      cp = c;
+      i++;
+      return true;
+    }
+    cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(c2 & 0x3F) << 6) | (c3 & 0x3F);
+    i += 3;
+    return true;
+  }
+
+  cp = c;
+  i++;
+  return true;
+}
+
+// Transliterate UTF-8 French text to ASCII for GLCD fonts (no accent support).
+String stripAccents(const String &input) {
+  String out;
+  out.reserve(input.length());
+
+  size_t i = 0;
+  while (i < input.length()) {
+    uint32_t cp = 0;
+    if (!utf8Decode(input, i, cp)) {
+      break;
+    }
+
+    char single = 0;
+    const char *multi = nullptr;
+
+    switch (cp) {
+      case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5:
+        single = 'a'; break;
+      case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5:
+        single = 'A'; break;
+      case 0x00E8: case 0x00E9: case 0x00EA: case 0x00EB:
+        single = 'e'; break;
+      case 0x00C8: case 0x00C9: case 0x00CA: case 0x00CB:
+        single = 'E'; break;
+      case 0x00EC: case 0x00ED: case 0x00EE: case 0x00EF:
+        single = 'i'; break;
+      case 0x00CC: case 0x00CD: case 0x00CE: case 0x00CF:
+        single = 'I'; break;
+      case 0x00F2: case 0x00F3: case 0x00F4: case 0x00F5: case 0x00F6:
+        single = 'o'; break;
+      case 0x00D2: case 0x00D3: case 0x00D4: case 0x00D5: case 0x00D6:
+        single = 'O'; break;
+      case 0x00F9: case 0x00FA: case 0x00FB: case 0x00FC:
+        single = 'u'; break;
+      case 0x00D9: case 0x00DA: case 0x00DB: case 0x00DC:
+        single = 'U'; break;
+      case 0x00E7:
+        single = 'c'; break;
+      case 0x00C7:
+        single = 'C'; break;
+      case 0x00F1:
+        single = 'n'; break;
+      case 0x00D1:
+        single = 'N'; break;
+      case 0x00FD: case 0x00FF:
+        single = 'y'; break;
+      case 0x00DD:
+        single = 'Y'; break;
+      case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014: case 0x2015:
+        single = '-'; break;
+      case 0x0153:
+        multi = "oe"; break;
+      case 0x0152:
+        multi = "OE"; break;
+      case 0x00E6:
+        multi = "ae"; break;
+      case 0x00C6:
+        multi = "AE"; break;
+      default:
+        if (cp < 0x80) {
+          out += (char)cp;
+        }
+        break;
+    }
+
+    if (single != 0) {
+      out += single;
+    } else if (multi != nullptr) {
+      out += multi;
+    }
+  }
+
+  return out;
+}
+
 bool syncNetworkTime() {
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
   tzset();
@@ -445,7 +562,8 @@ void drawHeader(const Stop &stop, const LineTheme &theme) {
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
   tft.setTextSize(STATION_TEXT_SIZE);
   int stationX = (theme.mode == BADGE_BUS) ? STATION_X_BUS : STATION_X;
-  String station = truncateToWidth(String(stop.label), SCREEN_W - stationX - 5, STATION_TEXT_SIZE);
+  String station = truncateToWidth(stripAccents(String(stop.label)), SCREEN_W - stationX - 5,
+                                   STATION_TEXT_SIZE);
   tft.setCursor(stationX, STATION_Y);
   tft.print(station);
 
@@ -502,7 +620,7 @@ void drawDestinationCell(int rowY, const String &destination) {
 
   tft.setTextColor(gColorDestText, TFT_WHITE);
   tft.setTextSize(2);
-  String dest = truncateToWidth(destination, DEST_MAX_W, 2);
+  String dest = truncateToWidth(stripAccents(destination), DEST_MAX_W, 2);
   tft.setCursor(DEST_PAD_X, rowY + 14);
   tft.print(dest);
 }
@@ -564,10 +682,10 @@ void drawErrorScreen(const Stop &stop, const char *title, const String &detail) 
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
   tft.setTextSize(2);
   tft.setCursor(DEST_PAD_X, ROW1_Y + 8);
-  tft.println(title);
+  tft.println(stripAccents(String(title)));
   tft.setTextSize(1);
   tft.setCursor(DEST_PAD_X, ROW1_Y + 28);
-  tft.println(detail);
+  tft.println(stripAccents(detail));
 }
 
 bool branchMatches(const char *branchRef, const char *branchFilter) {
