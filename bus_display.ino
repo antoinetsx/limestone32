@@ -38,8 +38,6 @@
 #define BODY_MAX_MS 60000
 #define HTTP_READ_CHUNK 512
 #define MAX_HTTP_REDIRECTS 3
-#define JSON_FILTER_CAPACITY 512
-#define JSON_DOC_CAPACITY 24576
 #define DEPARTURE_PATH_MAX 256
 #define DEPARTURE_DEST_MAX 64
 // Leon/Cloudflare omits Content-Length; HTTP/1.0 needs manual stream read (~100 KB max hub).
@@ -1402,7 +1400,6 @@ bool fetchAndDisplay(int stopIndex) {
   Serial.println(path);
 
   JsonDocument doc;
-  doc.reserve(JSON_DOC_CAPACITY);
   DeserializationError err = DeserializationError::EmptyInput;
   int httpCode = 0;
   int responseBytes = 0;
@@ -1615,7 +1612,6 @@ void setup() {
       Serial.println(i);
     }
   }
-  gFilterDoc.reserve(JSON_FILTER_CAPACITY);
   configureDeparturesFilter(gFilterDoc);
 }
 
