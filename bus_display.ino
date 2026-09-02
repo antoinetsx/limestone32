@@ -32,9 +32,6 @@
 #define LEON_API_HOST "ecrans-api.gwadz.fr"
 #define FETCH_INTERVAL_MS 60000
 #define TLS_TIMEOUT_SEC 15
-// RER hubs return ~35 KB JSON; default JsonDocument pool is too small without a field filter.
-#define JSON_DOC_CAPACITY 28672
-
 // --- Layout (240x135 landscape, rotation 1) ---
 static const int SCREEN_W = 240;
 static const int SCREEN_H = 135;
@@ -813,15 +810,15 @@ void configureDeparturesFilter(JsonDocument &filter) {
   filter.clear();
   filter["error"] = true;
   filter["message"] = true;
-  filter["departures"][*]["branchRef"] = true;
-  filter["departures"][*]["lineRef"] = true;
-  filter["departures"][*]["dateTime"] = true;
-  filter["departures"][*]["isAtStop"] = true;
-  filter["departures"][*]["shortDestinationLabel"] = true;
-  filter["departures"][*]["destinationLabel"] = true;
-  filter["departures"][*]["directionName"] = true;
-  filter["departures"][*]["destinationStopPointLabel"] = true;
-  filter["departures"][*]["flags"] = true;
+  filter["departures"]["*"]["branchRef"] = true;
+  filter["departures"]["*"]["lineRef"] = true;
+  filter["departures"]["*"]["dateTime"] = true;
+  filter["departures"]["*"]["isAtStop"] = true;
+  filter["departures"]["*"]["shortDestinationLabel"] = true;
+  filter["departures"]["*"]["destinationLabel"] = true;
+  filter["departures"]["*"]["directionName"] = true;
+  filter["departures"]["*"]["destinationStopPointLabel"] = true;
+  filter["departures"]["*"]["flags"] = true;
 }
 
 // Returns true when the board was drawn; false when superseded by a stop switch.
@@ -884,11 +881,12 @@ bool fetchAndDisplay(Stop &stop) {
     return !isFetchStale(generation);
   }
 
-  JsonDocument filter;
-  configureDeparturesFilter(filter);
+  JsonDocument filterDoc;
+  configureDeparturesFilter(filterDoc);
 
-  JsonDocument doc(JSON_DOC_CAPACITY);
-  DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+  JsonDocument doc;
+  DeserializationError err =
+      deserializeJson(doc, payload, DeserializationOption::Filter(filterDoc));
   if (err) {
     String detail = String(err.c_str());
     detail += " (";
