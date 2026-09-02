@@ -46,15 +46,26 @@ def parse_stop_entry(
     elif second.startswith("screen?"):
         query = parse_qs(second.split("?", 1)[1])
     elif len(parts) >= 4:
-        destination_filter = parts[4].strip() if len(parts) >= 5 else ""
-        badge_text = parts[5].strip() if len(parts) >= 6 else ""
-        badge_color = parts[6].strip() if len(parts) >= 7 else ""
-        badge_mode = parts[7].strip() if len(parts) >= 8 else ""
+        while parts and not parts[-1].strip():
+            parts.pop()
+        stop_id = parts[1].strip()
+        line_id = parts[2].strip()
+        branch_hash = parts[3].strip()
+        if len(parts) >= 8:
+            destination_filter = "|".join(part.strip() for part in parts[4:-3])
+            badge_text = parts[-3].strip()
+            badge_color = parts[-2].strip()
+            badge_mode = parts[-1].strip()
+        else:
+            destination_filter = parts[4].strip() if len(parts) >= 5 else ""
+            badge_text = parts[5].strip() if len(parts) >= 6 else ""
+            badge_color = parts[6].strip() if len(parts) >= 7 else ""
+            badge_mode = parts[7].strip() if len(parts) >= 8 else ""
         return (
             label,
-            parts[1].strip(),
-            parts[2].strip(),
-            parts[3].strip(),
+            stop_id,
+            line_id,
+            branch_hash,
             destination_filter,
             badge_text,
             badge_color,

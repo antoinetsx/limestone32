@@ -890,7 +890,7 @@ bool containsIgnoreCase(const char *haystack, const char *needle) {
 }
 
 bool destinationMatches(JsonObject departure, const char *destinationFilter) {
-  if (destinationFilter == nullptr || strlen(destinationFilter) == 0) {
+  if (destinationFilter == nullptr || destinationFilter[0] == '\0') {
     return true;
   }
 
@@ -901,11 +901,45 @@ bool destinationMatches(JsonObject departure, const char *destinationFilter) {
     departure["destinationStopPointLabel"] | "",
   };
 
-  for (const char *label : labels) {
-    if (containsIgnoreCase(label, destinationFilter)) {
-      return true;
+  const char *cursor = destinationFilter;
+  while (*cursor != '\0') {
+    const char *segmentStart = cursor;
+    while (*cursor != '\0' && *cursor != '|') {
+      cursor++;
     }
+    const char *segmentEnd = cursor;
+
+    while (segmentStart < segmentEnd &&
+           isspace((unsigned char)*segmentStart)) {
+      segmentStart++;
+    }
+    while (segmentEnd > segmentStart &&
+           isspace((unsigned char)*(segmentEnd - 1))) {
+      segmentEnd--;
+    }
+
+    if (segmentEnd > segmentStart) {
+      char term[64];
+      size_t termLen = segmentEnd - segmentStart;
+      if (termLen >= sizeof(term)) {
+        termLen = sizeof(term) - 1;
+      }
+      memcpy(term, segmentStart, termLen);
+      term[termLen] = '\0';
+
+      for (const char *label : labels) {
+        if (containsIgnoreCase(label, term)) {
+          return true;
+        }
+      }
+    }
+
+    if (*cursor == '\0') {
+      break;
+    }
+    cursor++;
   }
+
   return false;
 }
 
