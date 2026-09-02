@@ -33,16 +33,21 @@
 #define FETCH_INTERVAL_MS 60000
 #define TLS_TIMEOUT_SEC 30
 #define CONNECT_ATTEMPT_MS 3000
-#define BODY_IDLE_MS 2000
+#define BUTTON_DEBOUNCE_MS 50
+#define BODY_IDLE_MS 800
 #define BODY_MAX_MS 60000
-#define HTTP_READ_CHUNK 256
+#define HTTP_READ_CHUNK 512
 #define MAX_HTTP_REDIRECTS 3
+#define JSON_FILTER_CAPACITY 512
+#define JSON_DOC_CAPACITY 24576
+#define DEPARTURE_PATH_MAX 256
+#define DEPARTURE_DEST_MAX 64
 // Leon/Cloudflare omits Content-Length; HTTP/1.0 needs manual stream read (~100 KB max hub).
 // --- Layout (240x135 landscape, rotation 1) ---
 static const int SCREEN_W = 240;
 static const int SCREEN_H = 135;
 static const int HEADER_H = 38;
-static const int BODY_Y = 38;
+static const int BODY_Y = HEADER_H;
 static const int BORDER_H = 5;
 static const int CONTENT_Y = BODY_Y + BORDER_H;
 static const int LEFT_W = 156;
@@ -68,8 +73,6 @@ static const int STATION_TEXT_H = 8 * STATION_TEXT_SIZE;
 static const int STATION_Y = BADGE_CENTER_Y - STATION_TEXT_H / 2;
 static const int MINUTES_NUM_SIZE = 3;
 static const int MINUTES_SUFFIX_SIZE = 1;
-static const int MINUTES_NUM_H = 8 * MINUTES_NUM_SIZE;
-static const int MINUTES_SUFFIX_H = 8 * MINUTES_SUFFIX_SIZE;
 static const int DEST_PAD_X = 5;
 static const int DEST_MAX_W = 149;
 static const int MAX_DEPARTURES = 2;
@@ -77,8 +80,9 @@ static const int MAX_DEPARTURES = 2;
 TFT_eSPI tft = TFT_eSPI();
 
 struct DepartureRow {
-  String destination;
+  char destination[DEPARTURE_DEST_MAX];
   int minutes;
+  time_t departureEpoch;
 };
 
 enum BadgeMode : uint8_t {
@@ -107,6 +111,18 @@ unsigned long lastFetch = 0;
 bool needsRefresh = true;
 volatile uint32_t fetchGeneration = 0;
 WiFiClientSecure *gActiveFetchClient = nullptr;
+
+LineTheme themes[NB_STOPS];
+char gDeparturePaths[NB_STOPS][DEPARTURE_PATH_MAX];
+JsonDocument gFilterDoc(JSON_FILTER_CAPACITY);
+
+DepartureRow gDisplayedRows[MAX_DEPARTURES];
+int gDisplayedCount = 0;
+int gDisplayedStopIndex = -1;
+bool gBoardVisible = false;
+bool gPendingLoadingDraw = false;
+int gLastDrawnStopIndex = -1;
+bool gShowingLoading = false;
 
 uint16_t gColorDestText;
 uint16_t gColorTimeYellow;
@@ -163,7 +179,7 @@ void setupDisplayColors() {
   gColorSepGray = color565FromHex(0xA9B1B9);
 }
 
-void drawLoadingScreen(const Stop &stop);
+void drawLoadingScreen(int stopIndex);
 
 bool isFetchStale(uint32_t generation) {
   return generation != fetchGeneration;
@@ -191,9 +207,10 @@ void pollNavigationButtons() {
     abortActiveFetchClient();
     currentStop = (currentStop + 1) % NB_STOPS;
     needsRefresh = true;
-    drawLoadingScreen(stops[currentStop]);
+    gBoardVisible = false;
+    gPendingLoadingDraw = true;
     unsigned long debounceStart = millis();
-    while (millis() - debounceStart < 50) {
+    while (millis() - debounceStart < BUTTON_DEBOUNCE_MS) {
       delay(5);
     }
   }
@@ -205,9 +222,10 @@ void pollNavigationButtons() {
     fetchGeneration++;
     abortActiveFetchClient();
     needsRefresh = true;
-    drawLoadingScreen(stops[currentStop]);
+    gBoardVisible = false;
+    gPendingLoadingDraw = true;
     unsigned long debounceStart = millis();
-    while (millis() - debounceStart < 50) {
+    while (millis() - debounceStart < BUTTON_DEBOUNCE_MS) {
       delay(5);
     }
   }
@@ -239,6 +257,34 @@ String urlEncode(const String &value) {
     }
   }
   return encoded;
+}
+
+size_t urlEncodeToBuffer(const char *value, char *out, size_t outLen) {
+  size_t pos = 0;
+  if (value == nullptr || outLen == 0) {
+    if (outLen > 0) {
+      out[0] = '\0';
+    }
+    return 0;
+  }
+
+  for (size_t i = 0; value[i] != '\0'; i++) {
+    unsigned char c = (unsigned char)value[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      if (pos + 1 >= outLen) {
+        break;
+      }
+      out[pos++] = (char)c;
+    } else {
+      if (pos + 3 >= outLen) {
+        break;
+      }
+      snprintf(out + pos, outLen - pos, "%%%02X", c);
+      pos += 3;
+    }
+  }
+  out[pos] = '\0';
+  return pos;
 }
 
 bool utf8Decode(const String &s, size_t &i, uint32_t &cp) {
@@ -556,7 +602,7 @@ bool connectTlsPoll(WiFiClientSecure &client, const char *host, uint32_t generat
   return false;
 }
 
-bool sendHttpGetRequest(WiFiClientSecure &client, const char *host, const String &path) {
+bool sendHttpGetRequest(WiFiClientSecure &client, const char *host, const char *path) {
   client.print("GET ");
   client.print(path);
   client.print(" HTTP/1.0\r\n");
@@ -641,7 +687,7 @@ bool isRedirectStatus(int httpCode) {
 
 // Parse JSON straight from the TLS stream. HTTP/1.0 avoids chunked encoding.
 // Skips buffering ~100 KB into a String (which OOM'd around 64 KB on RER hubs).
-DeserializationError fetchDeparturesJson(const char *host, const String &path, JsonDocument &doc,
+DeserializationError fetchDeparturesJson(const char *host, const char *path, JsonDocument &doc,
                                          const JsonDocument &filterDoc, int &httpCode,
                                          String &errorMsg, int &responseBytes,
                                          uint32_t generation) {
@@ -668,7 +714,9 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
     return DeserializationError::EmptyInput;
   }
 
-  String requestPath = path;
+  char requestPathBuf[DEPARTURE_PATH_MAX];
+  strncpy(requestPathBuf, path, sizeof(requestPathBuf) - 1);
+  requestPathBuf[sizeof(requestPathBuf) - 1] = '\0';
   int contentLength = -1;
   char location[256];
 
@@ -686,7 +734,7 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
       return DeserializationError::EmptyInput;
     }
 
-    sendHttpGetRequest(client, host, requestPath);
+    sendHttpGetRequest(client, host, requestPathBuf);
 
     ReadHeadersResult headerResult =
         readHttpResponseHeaders(&client, httpCode, contentLength, location, sizeof(location),
@@ -711,7 +759,13 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
         releaseActiveFetchClient(client);
         return DeserializationError::EmptyInput;
       }
-      requestPath = nextPath;
+      if (nextPath.length() >= sizeof(requestPathBuf)) {
+        errorMsg = "Redirect path too long";
+        releaseActiveFetchClient(client);
+        return DeserializationError::EmptyInput;
+      }
+      strncpy(requestPathBuf, nextPath.c_str(), sizeof(requestPathBuf) - 1);
+      requestPathBuf[sizeof(requestPathBuf) - 1] = '\0';
       releaseActiveFetchClient(client);
       gActiveFetchClient = &client;
       if (!connectTlsPoll(client, host, generation, errorMsg)) {
@@ -898,43 +952,6 @@ String truncateToWidth(const String &text, int maxWidth, uint8_t textSize) {
   return truncated + "...";
 }
 
-int minutesUntilDeparture(const char *isoUtc) {
-  if (isoUtc == nullptr || isoUtc[0] == '\0') {
-    return -1;
-  }
-
-  char isoBuf[32];
-  strncpy(isoBuf, isoUtc, sizeof(isoBuf) - 1);
-  isoBuf[sizeof(isoBuf) - 1] = '\0';
-  char *fraction = strchr(isoBuf, '.');
-  if (fraction != nullptr) {
-    *fraction = '\0';
-  }
-
-  struct tm departure = {};
-  if (strptime(isoBuf, "%Y-%m-%dT%H:%M:%S", &departure) == nullptr) {
-    return -1;
-  }
-
-  setenv("TZ", "UTC0", 1);
-  tzset();
-  time_t departureUtc = mktime(&departure);
-
-  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
-  tzset();
-
-  time_t now = time(nullptr);
-  if (departureUtc == (time_t)-1 || now == (time_t)-1) {
-    return -1;
-  }
-
-  long secondsUntil = difftime(departureUtc, now);
-  if (secondsUntil < 0) {
-    return 0;
-  }
-  return (int)((secondsUntil + 59) / 60);
-}
-
 void drawBadgeTextCentered(int x, int y, int w, int h, const char *label, uint8_t textSize,
                            uint16_t textColor, uint16_t bgColor) {
   tft.setTextColor(textColor, bgColor);
@@ -1059,12 +1076,12 @@ void drawMinutesCell(int rowY, int minutes) {
   tft.print("min");
 }
 
-void drawDestinationCell(int rowY, const String &destination) {
+void drawDestinationCell(int rowY, const char *destination) {
   tft.fillRect(0, rowY, LEFT_W, ROW_H, TFT_WHITE);
 
   tft.setTextColor(gColorDestText, TFT_WHITE);
   tft.setTextSize(2);
-  String dest = truncateToWidth(stripAccents(destination), DEST_MAX_W, 2);
+  String dest = truncateToWidth(stripAccents(String(destination)), DEST_MAX_W, 2);
   tft.setCursor(DEST_PAD_X, rowY + 14);
   tft.print(dest);
 }
@@ -1076,14 +1093,18 @@ void drawRowSeparator() {
   tft.fillRect(RIGHT_X, SEP_Y, RIGHT_W, 1, TFT_WHITE);
 }
 
-void drawDepartureBoard(const Stop &stop, const DepartureRow *rows, int count) {
-  LineTheme theme = themeForStop(stop);
+void drawDepartureBoard(int stopIndex, const DepartureRow *rows, int count, bool keepHeader) {
+  const Stop &stop = stops[stopIndex];
+  const LineTheme &theme = themes[stopIndex];
 
-  tft.fillScreen(TFT_WHITE);
-  drawHeader(stop, theme);
-
-  tft.fillRect(0, CONTENT_Y, LEFT_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
-  tft.fillRect(RIGHT_X, CONTENT_Y, RIGHT_W, SCREEN_H - CONTENT_Y, TFT_BLACK);
+  if (!keepHeader) {
+    tft.fillScreen(TFT_WHITE);
+    drawHeader(stop, theme);
+    gLastDrawnStopIndex = stopIndex;
+  } else {
+    tft.fillRect(0, CONTENT_Y, LEFT_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
+    tft.fillRect(RIGHT_X, CONTENT_Y, RIGHT_W, SCREEN_H - CONTENT_Y, TFT_BLACK);
+  }
 
   if (count >= 1) {
     drawDestinationCell(ROW1_Y, rows[0].destination);
@@ -1102,24 +1123,41 @@ void drawDepartureBoard(const Stop &stop, const DepartureRow *rows, int count) {
     drawDestinationCell(ROW2_Y, "");
     drawMinutesCell(ROW2_Y, -1);
   }
+
+  gShowingLoading = false;
 }
 
-void drawLoadingScreen(const Stop &stop) {
-  LineTheme theme = themeForStop(stop);
-  tft.fillScreen(TFT_WHITE);
-  drawHeader(stop, theme);
-  tft.fillRect(0, CONTENT_Y, SCREEN_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
+void drawLoadingScreen(int stopIndex) {
+  const Stop &stop = stops[stopIndex];
+  const LineTheme &theme = themes[stopIndex];
+
+  if (gLastDrawnStopIndex != stopIndex) {
+    tft.fillScreen(TFT_WHITE);
+    drawHeader(stop, theme);
+    gLastDrawnStopIndex = stopIndex;
+  } else {
+    tft.fillRect(0, CONTENT_Y, SCREEN_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
+  }
+
   tft.setTextColor(gColorDestText, TFT_WHITE);
   tft.setTextSize(2);
   tft.setCursor(DEST_PAD_X, ROW1_Y + 14);
   tft.print("Loading...");
+  gShowingLoading = true;
 }
 
-void drawErrorScreen(const Stop &stop, const char *title, const String &detail) {
-  LineTheme theme = themeForStop(stop);
-  tft.fillScreen(TFT_WHITE);
-  drawHeader(stop, theme);
-  tft.fillRect(0, CONTENT_Y, SCREEN_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
+void drawErrorScreen(int stopIndex, const char *title, const String &detail) {
+  const Stop &stop = stops[stopIndex];
+  const LineTheme &theme = themes[stopIndex];
+
+  if (gLastDrawnStopIndex != stopIndex) {
+    tft.fillScreen(TFT_WHITE);
+    drawHeader(stop, theme);
+    gLastDrawnStopIndex = stopIndex;
+  } else {
+    tft.fillRect(0, CONTENT_Y, SCREEN_W, SCREEN_H - CONTENT_Y, TFT_WHITE);
+  }
+
   tft.setTextColor(TFT_BLACK, TFT_WHITE);
   tft.setTextSize(2);
   tft.setCursor(DEST_PAD_X, ROW1_Y + 8);
@@ -1127,9 +1165,86 @@ void drawErrorScreen(const Stop &stop, const char *title, const String &detail) 
   tft.setTextSize(1);
   tft.setCursor(DEST_PAD_X, ROW1_Y + 28);
   tft.println(stripAccents(detail));
+  gShowingLoading = false;
 }
 
 // --- Departure filtering ---
+
+// Parse ISO8601 UTC datetime to epoch. Caller must have TZ=UTC active.
+bool parseIsoUtcEpoch(const char *isoUtc, time_t &outEpoch) {
+  if (isoUtc == nullptr || isoUtc[0] == '\0') {
+    return false;
+  }
+
+  char isoBuf[32];
+  strncpy(isoBuf, isoUtc, sizeof(isoBuf) - 1);
+  isoBuf[sizeof(isoBuf) - 1] = '\0';
+  char *fraction = strchr(isoBuf, '.');
+  if (fraction != nullptr) {
+    *fraction = '\0';
+  }
+
+  struct tm departure = {};
+  if (strptime(isoBuf, "%Y-%m-%dT%H:%M:%S", &departure) == nullptr) {
+    return false;
+  }
+
+  outEpoch = mktime(&departure);
+  return outEpoch != (time_t)-1;
+}
+
+void departureTimingFromEpoch(time_t depEpoch, time_t nowEpoch, bool isAtStop, int &minutes,
+                              bool &isPast) {
+  long secondsUntil = difftime(depEpoch, nowEpoch);
+  if (isAtStop) {
+    isPast = secondsUntil < -120;
+  } else {
+    isPast = secondsUntil < -300;
+  }
+  if (secondsUntil < 0) {
+    minutes = 0;
+  } else {
+    minutes = (int)((secondsUntil + 59) / 60);
+  }
+}
+
+void copyDestinationLabel(char *dest, size_t destLen, JsonObject departure) {
+  const char *direction = departure["shortDestinationLabel"] | "";
+  if (direction[0] == '\0') {
+    direction = departure["destinationLabel"] | "";
+  }
+  if (direction[0] == '\0') {
+    direction = departure["directionName"] | "Destination";
+  }
+  strncpy(dest, direction, destLen - 1);
+  dest[destLen - 1] = '\0';
+}
+
+void updateMinuteCountdown() {
+  if (!gBoardVisible || gDisplayedCount <= 0 || gDisplayedStopIndex < 0) {
+    return;
+  }
+
+  time_t nowEpoch = time(nullptr);
+  if (nowEpoch == (time_t)-1) {
+    return;
+  }
+
+  static const int rowYs[MAX_DEPARTURES] = {ROW1_Y, ROW2_Y};
+  for (int i = 0; i < gDisplayedCount; i++) {
+    if (gDisplayedRows[i].departureEpoch == 0) {
+      continue;
+    }
+    int minutes = 0;
+    bool isPast = false;
+    departureTimingFromEpoch(gDisplayedRows[i].departureEpoch, nowEpoch,
+                             false, minutes, isPast);
+    if (minutes != gDisplayedRows[i].minutes) {
+      gDisplayedRows[i].minutes = minutes;
+      drawMinutesCell(rowYs[i], minutes);
+    }
+  }
+}
 
 bool branchMatches(const char *branchRef, const char *branchFilter) {
   if (branchFilter == nullptr || strlen(branchFilter) == 0) {
@@ -1226,43 +1341,6 @@ bool destinationMatches(JsonObject departure, const char *destinationFilter) {
   return false;
 }
 
-bool isPastDeparture(const char *isoUtc, bool isAtStop) {
-  if (isoUtc == nullptr || isoUtc[0] == '\0') {
-    return false;
-  }
-
-  char isoBuf[32];
-  strncpy(isoBuf, isoUtc, sizeof(isoBuf) - 1);
-  isoBuf[sizeof(isoBuf) - 1] = '\0';
-  char *fraction = strchr(isoBuf, '.');
-  if (fraction != nullptr) {
-    *fraction = '\0';
-  }
-
-  struct tm departure = {};
-  if (strptime(isoBuf, "%Y-%m-%dT%H:%M:%S", &departure) == nullptr) {
-    return false;
-  }
-
-  setenv("TZ", "UTC0", 1);
-  tzset();
-  time_t departureUtc = mktime(&departure);
-
-  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
-  tzset();
-
-  time_t now = time(nullptr);
-  if (departureUtc == (time_t)-1 || now == (time_t)-1) {
-    return false;
-  }
-
-  long secondsUntil = difftime(departureUtc, now);
-  if (isAtStop) {
-    return secondsUntil < -120;
-  }
-  return secondsUntil < -300;
-}
-
 bool isCancelled(JsonObject departure) {
   JsonArray flags = departure["flags"].as<JsonArray>();
   for (JsonVariant flag : flags) {
@@ -1273,12 +1351,18 @@ bool isCancelled(JsonObject departure) {
   return false;
 }
 
-String buildDeparturesPath(const Stop &stop) {
-  String lineJson = "[\"" + String(stop.lineId) + "\"]";
-  String path = "/departures/" + urlEncode(String(stop.stopId));
-  path += "?linesIds=" + urlEncode(lineJson);
-  path += "&getLineNotice=false";
-  return path;
+bool buildDeparturesPath(const Stop &stop, char *path, size_t pathLen) {
+  char encodedStopId[128];
+  char lineJson[128];
+  char encodedLines[256];
+
+  snprintf(lineJson, sizeof(lineJson), "[\"%s\"]", stop.lineId);
+  urlEncodeToBuffer(stop.stopId, encodedStopId, sizeof(encodedStopId));
+  urlEncodeToBuffer(lineJson, encodedLines, sizeof(encodedLines));
+
+  int n = snprintf(path, pathLen, "/departures/%s?linesIds=%s&getLineNotice=false",
+                   encodedStopId, encodedLines);
+  return n > 0 && (size_t)n < pathLen;
 }
 
 void configureDeparturesFilter(JsonDocument &filter) {
@@ -1298,27 +1382,26 @@ void configureDeparturesFilter(JsonDocument &filter) {
 }
 
 // Returns true when the board was drawn; false when superseded by a stop switch.
-bool fetchAndDisplay(Stop &stop) {
+bool fetchAndDisplay(int stopIndex) {
+  Stop &stop = stops[stopIndex];
   const uint32_t generation = fetchGeneration;
-  drawLoadingScreen(stop);
+  gBoardVisible = false;
+  drawLoadingScreen(stopIndex);
   if (isFetchStale(generation)) {
     return false;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    drawErrorScreen(stop, "Wi-Fi disconnected", "");
+    drawErrorScreen(stopIndex, "Wi-Fi disconnected", "");
     return !isFetchStale(generation);
   }
 
-  String path = buildDeparturesPath(stop);
+  const char *path = gDeparturePaths[stopIndex];
   Serial.print("Request: https://");
   Serial.print(LEON_API_HOST);
   Serial.println(path);
 
-  JsonDocument filterDoc;
-  configureDeparturesFilter(filterDoc);
-
-  JsonDocument doc;
+  JsonDocument doc(JSON_DOC_CAPACITY);
   DeserializationError err = DeserializationError::EmptyInput;
   int httpCode = 0;
   int responseBytes = 0;
@@ -1330,7 +1413,7 @@ bool fetchAndDisplay(Stop &stop) {
     }
 
     doc.clear();
-    err = fetchDeparturesJson(LEON_API_HOST, path, doc, filterDoc, httpCode, errorMsg,
+    err = fetchDeparturesJson(LEON_API_HOST, path, doc, gFilterDoc, httpCode, errorMsg,
                               responseBytes, generation);
 
     if (err == DeserializationError::Ok && !doc.overflowed()) {
@@ -1365,18 +1448,18 @@ bool fetchAndDisplay(Stop &stop) {
 
   if (httpCode <= 0) {
     String detail = errorMsg.length() > 0 ? errorMsg : "Connection failed";
-    drawErrorScreen(stop, "HTTPS error", detail);
+    drawErrorScreen(stopIndex, "HTTPS error", detail);
     return !isFetchStale(generation);
   }
 
   if (httpCode != 200) {
-    drawErrorScreen(stop, "HTTP error", String(httpCode) + " - " + errorMsg);
+    drawErrorScreen(stopIndex, "HTTP error", String(httpCode) + " - " + errorMsg);
     return !isFetchStale(generation);
   }
 
   if (err || doc.overflowed()) {
     String detail = err ? String(err.c_str()) : "overflow";
-    drawErrorScreen(stop, "JSON error", detail);
+    drawErrorScreen(stopIndex, "JSON error", detail);
     Serial.println(err ? err.c_str() : "JsonDocument overflow");
     return !isFetchStale(generation);
   }
@@ -1387,7 +1470,7 @@ bool fetchAndDisplay(Stop &stop) {
 
   const char *apiError = doc["error"] | doc["message"] | "";
   if (apiError[0] != '\0') {
-    drawErrorScreen(stop, "API error", apiError);
+    drawErrorScreen(stopIndex, "API error", apiError);
     return !isFetchStale(generation);
   }
 
@@ -1396,6 +1479,7 @@ bool fetchAndDisplay(Stop &stop) {
   Serial.println(departures.size());
 
   DepartureRow rows[MAX_DEPARTURES];
+  memset(rows, 0, sizeof(rows));
   int shown = 0;
   int skippedBranch = 0;
   int skippedLine = 0;
@@ -1403,9 +1487,15 @@ bool fetchAndDisplay(Stop &stop) {
   int skippedCancelled = 0;
   int skippedPast = 0;
 
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  time_t nowUtc = time(nullptr);
+
   for (JsonObject departure : departures) {
     pollNavigationButtons();
     if (isFetchStale(generation)) {
+      setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+      tzset();
       return false;
     }
 
@@ -1429,26 +1519,32 @@ bool fetchAndDisplay(Stop &stop) {
       skippedCancelled++;
       continue;
     }
-    if (isPastDeparture(dateTime, atStop)) {
+
+    time_t depEpoch = 0;
+    if (!parseIsoUtcEpoch(dateTime, depEpoch)) {
       skippedPast++;
       continue;
     }
 
-    String direction = departure["shortDestinationLabel"] | "";
-    if (direction.length() == 0) {
-      direction = departure["destinationLabel"] | "";
-    }
-    if (direction.length() == 0) {
-      direction = departure["directionName"] | "Destination";
+    int minutes = 0;
+    bool isPast = false;
+    departureTimingFromEpoch(depEpoch, nowUtc, atStop, minutes, isPast);
+    if (isPast) {
+      skippedPast++;
+      continue;
     }
 
-    rows[shown].destination = direction;
-    rows[shown].minutes = minutesUntilDeparture(dateTime);
+    copyDestinationLabel(rows[shown].destination, sizeof(rows[shown].destination), departure);
+    rows[shown].minutes = minutes;
+    rows[shown].departureEpoch = depEpoch;
     shown++;
     if (shown >= MAX_DEPARTURES) {
       break;
     }
   }
+
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
 
   Serial.print("After filter: shown=");
   Serial.print(shown);
@@ -1467,7 +1563,16 @@ bool fetchAndDisplay(Stop &stop) {
     return false;
   }
 
-  drawDepartureBoard(stop, rows, shown);
+  const bool keepHeader = (gLastDrawnStopIndex == stopIndex && gShowingLoading);
+  drawDepartureBoard(stopIndex, rows, shown, keepHeader);
+
+  for (int i = 0; i < shown; i++) {
+    gDisplayedRows[i] = rows[i];
+  }
+  gDisplayedCount = shown;
+  gDisplayedStopIndex = stopIndex;
+  gBoardVisible = true;
+
   return true;
 }
 
@@ -1501,13 +1606,29 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   syncNetworkTime();
+
+  for (int i = 0; i < NB_STOPS; i++) {
+    themes[i] = themeForStop(stops[i]);
+    if (!buildDeparturesPath(stops[i], gDeparturePaths[i], DEPARTURE_PATH_MAX)) {
+      Serial.print("Warning: departure path too long for stop ");
+      Serial.println(i);
+    }
+  }
+  configureDeparturesFilter(gFilterDoc);
 }
 
 void loop() {
   pollNavigationButtons();
 
+  if (gPendingLoadingDraw) {
+    gPendingLoadingDraw = false;
+    drawLoadingScreen(currentStop);
+  }
+
+  updateMinuteCountdown();
+
   if (needsRefresh || millis() - lastFetch > FETCH_INTERVAL_MS) {
-    if (fetchAndDisplay(stops[currentStop])) {
+    if (fetchAndDisplay(currentStop)) {
       lastFetch = millis();
       needsRefresh = false;
     }
