@@ -153,13 +153,40 @@ void setupDisplayColors() {
   gColorSepGray = color565FromHex(0xA9B1B9);
 }
 
+void drawLoadingScreen(const Stop &stop);
+
 bool isFetchStale(uint32_t generation) {
   return generation != fetchGeneration;
+}
+
+// Poll NEXT/REFRESH during blocking fetch I/O so stop switches are instant.
+void pollNavigationButtons() {
+  static bool lastNextState = HIGH;
+  bool nextState = digitalRead(BUTTON_NEXT);
+  if (nextState == LOW && lastNextState == HIGH) {
+    fetchGeneration++;
+    currentStop = (currentStop + 1) % NB_STOPS;
+    needsRefresh = true;
+    drawLoadingScreen(stops[currentStop]);
+    delay(50);
+  }
+  lastNextState = nextState;
+
+  static bool lastRefreshState = HIGH;
+  bool refreshState = digitalRead(BUTTON_REFRESH);
+  if (refreshState == LOW && lastRefreshState == HIGH) {
+    fetchGeneration++;
+    needsRefresh = true;
+    drawLoadingScreen(stops[currentStop]);
+    delay(50);
+  }
+  lastRefreshState = refreshState;
 }
 
 void delayUnlessStale(uint32_t generation, unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) {
+    pollNavigationButtons();
     if (isFetchStale(generation)) {
       return;
     }
@@ -319,8 +346,8 @@ bool syncNetworkTime() {
 // Wrap TLS stream: count bytes and block-read until idle (TLS may outlive http.connected()).
 class IdleCountingStream : public Stream {
  public:
-  IdleCountingStream(Stream *source, unsigned long maxMs)
-      : _source(source), _count(0), _deadline(millis() + maxMs) {}
+  IdleCountingStream(Stream *source, unsigned long maxMs, uint32_t generation)
+      : _source(source), _count(0), _deadline(millis() + maxMs), _generation(generation) {}
 
   size_t byteCount() const { return _count; }
 
@@ -348,6 +375,11 @@ class IdleCountingStream : public Stream {
     unsigned long lastByteMs = millis();
 
     while (total < length && millis() < _deadline) {
+      pollNavigationButtons();
+      if (isFetchStale(_generation)) {
+        break;
+      }
+
       const int avail = _source->available();
       if (avail > 0) {
         const size_t n = _source->readBytes(buffer + total, length - total);
@@ -373,11 +405,12 @@ class IdleCountingStream : public Stream {
   Stream *_source;
   size_t _count;
   unsigned long _deadline;
+  uint32_t _generation;
 };
 
 // Drain unread TLS bytes until idle (no data for BODY_IDLE_MS) or BODY_MAX_MS elapsed.
 static size_t drainStreamIdle(Stream *stream, size_t alreadyRead, char *stopReason,
-                              size_t stopReasonLen) {
+                              size_t stopReasonLen, uint32_t generation) {
   if (stream == nullptr) {
     strncpy(stopReason, "no_stream", stopReasonLen);
     return alreadyRead;
@@ -389,6 +422,12 @@ static size_t drainStreamIdle(Stream *stream, size_t alreadyRead, char *stopReas
   const unsigned long deadline = millis() + BODY_MAX_MS;
 
   while (millis() < deadline) {
+    pollNavigationButtons();
+    if (isFetchStale(generation)) {
+      strncpy(stopReason, "aborted", stopReasonLen);
+      return total;
+    }
+
     const int avail = stream->available();
     if (avail > 0) {
       const int n = stream->readBytes(buf, sizeof(buf));
@@ -413,8 +452,15 @@ static size_t drainStreamIdle(Stream *stream, size_t alreadyRead, char *stopReas
 // Skips buffering ~100 KB into a String (which OOM'd around 64 KB on RER hubs).
 DeserializationError fetchDeparturesJson(const char *host, const String &path, JsonDocument &doc,
                                          const JsonDocument &filterDoc, int &httpCode,
-                                         String &errorMsg, int &responseBytes) {
+                                         String &errorMsg, int &responseBytes,
+                                         uint32_t generation) {
   responseBytes = 0;
+  if (isFetchStale(generation)) {
+    errorMsg = "Aborted";
+    httpCode = 0;
+    return DeserializationError::EmptyInput;
+  }
+
   WiFiClientSecure client;
   client.setInsecure();
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
@@ -424,11 +470,31 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
 #endif
   client.setHandshakeTimeout(15);
 
+  const unsigned long connectDeadline = millis() + TLS_TIMEOUT_SEC * 1000UL;
+  while (millis() < connectDeadline) {
+    pollNavigationButtons();
+    if (isFetchStale(generation)) {
+      errorMsg = "Aborted";
+      httpCode = 0;
+      return DeserializationError::EmptyInput;
+    }
+    if (client.connect(host, 443)) {
+      break;
+    }
+    delay(10);
+  }
+  if (!client.connected()) {
+    errorMsg = "TLS connect failed";
+    httpCode = 0;
+    return DeserializationError::EmptyInput;
+  }
+
   HTTPClient http;
   String url = String("https://") + host + path;
   if (!http.begin(client, url)) {
     errorMsg = "HTTP init failed";
     httpCode = 0;
+    client.stop();
     return DeserializationError::EmptyInput;
   }
 
@@ -440,7 +506,21 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
   http.addHeader("Accept-Encoding", "identity");
   http.addHeader("User-Agent", "bus-display-esp32/2.0");
 
+  if (isFetchStale(generation)) {
+    errorMsg = "Aborted";
+    httpCode = 0;
+    http.end();
+    return DeserializationError::EmptyInput;
+  }
+
   httpCode = http.GET();
+  if (isFetchStale(generation)) {
+    errorMsg = "Aborted";
+    httpCode = 0;
+    http.end();
+    return DeserializationError::EmptyInput;
+  }
+
   if (httpCode <= 0) {
     errorMsg = http.errorToString(httpCode);
     http.end();
@@ -461,24 +541,37 @@ DeserializationError fetchDeparturesJson(const char *host, const String &path, J
     return DeserializationError::EmptyInput;
   }
 
-  IdleCountingStream bodyStream(stream, BODY_MAX_MS);
+  IdleCountingStream bodyStream(stream, BODY_MAX_MS, generation);
   const DeserializationError err =
       deserializeJson(doc, bodyStream, DeserializationOption::Filter(filterDoc));
 
   char stopReason[12] = "complete";
   size_t totalBytes = bodyStream.byteCount();
+  if (isFetchStale(generation)) {
+    strncpy(stopReason, "aborted", sizeof(stopReason));
+    http.end();
+    errorMsg = "Aborted";
+    responseBytes = (int)totalBytes;
+    return DeserializationError::EmptyInput;
+  }
+
   if (err == DeserializationError::Ok) {
     strncpy(stopReason, "complete", sizeof(stopReason));
   } else if (err == DeserializationError::IncompleteInput) {
-    totalBytes = drainStreamIdle(stream, totalBytes, stopReason, sizeof(stopReason));
+    totalBytes = drainStreamIdle(stream, totalBytes, stopReason, sizeof(stopReason), generation);
   } else if (stream->available() > 0) {
-    totalBytes = drainStreamIdle(stream, totalBytes, stopReason, sizeof(stopReason));
+    totalBytes = drainStreamIdle(stream, totalBytes, stopReason, sizeof(stopReason), generation);
   } else {
     strncpy(stopReason, "parse_error", sizeof(stopReason));
   }
 
   http.end();
   responseBytes = (int)totalBytes;
+
+  if (isFetchStale(generation)) {
+    errorMsg = "Aborted";
+    return DeserializationError::EmptyInput;
+  }
 
   Serial.print("Fetch: read ");
   Serial.print(responseBytes);
@@ -1049,7 +1142,7 @@ bool fetchAndDisplay(Stop &stop) {
 
     doc.clear();
     err = fetchDeparturesJson(LEON_API_HOST, path, doc, filterDoc, httpCode, errorMsg,
-                              responseBytes);
+                              responseBytes, generation);
 
     if (err == DeserializationError::Ok && !doc.overflowed()) {
       break;
@@ -1217,24 +1310,7 @@ void setup() {
 }
 
 void loop() {
-  static bool lastNextState = HIGH;
-  bool nextState = digitalRead(BUTTON_NEXT);
-  if (nextState == LOW && lastNextState == HIGH) {
-    fetchGeneration++;
-    currentStop = (currentStop + 1) % NB_STOPS;
-    needsRefresh = true;
-    delay(50);
-  }
-  lastNextState = nextState;
-
-  static bool lastRefreshState = HIGH;
-  bool refreshState = digitalRead(BUTTON_REFRESH);
-  if (refreshState == LOW && lastRefreshState == HIGH) {
-    fetchGeneration++;
-    needsRefresh = true;
-    delay(50);
-  }
-  lastRefreshState = refreshState;
+  pollNavigationButtons();
 
   if (needsRefresh || millis() - lastFetch > FETCH_INTERVAL_MS) {
     if (fetchAndDisplay(stops[currentStop])) {
